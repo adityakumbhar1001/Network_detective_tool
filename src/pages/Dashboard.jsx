@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import {
   Wifi,
   ShieldCheck,
@@ -6,30 +5,11 @@ import {
   Activity,
 } from "lucide-react";
 
-import {
-  getNetworks,
-  getAlerts,
-  getTrustedAP,
-} from "../services/api";
+import { useWifiData } from "../useWifiData";
 
 function Dashboard() {
-  const [networks, setNetworks] = useState([]);
-  const [alerts, setAlerts] = useState([]);
-  const [trustedAP, setTrustedAP] = useState(null);
-
-  useEffect(() => {
-    async function loadDashboard() {
-      const networkData = await getNetworks();
-      const alertData = await getAlerts();
-      const trustedData = await getTrustedAP();
-
-      setNetworks(networkData);
-      setAlerts(alertData);
-      setTrustedAP(trustedData);
-    }
-
-    loadDashboard();
-  }, []);
+  const { networks, alerts, securityAlerts = [], trustedAP, modeLabel } = useWifiData();
+  const activeSecurityAlerts = securityAlerts.filter((alert) => alert.status !== "Resolved");
 
   const anomalyScore =
     alerts.length > 0 ? alerts[0].anomalyScore : 0;
@@ -47,7 +27,7 @@ function Dashboard() {
 
         <div className="status-badge">
           <span></span>
-          DEMO MODE
+          {modeLabel}
         </div>
       </div>
 
@@ -145,7 +125,7 @@ function Dashboard() {
               <AlertTriangle size={22} />
 
               <div>
-                <strong>Potential Duplicate Network</strong>
+                <strong>{alerts[0].message ?? "Potential Duplicate Network"}</strong>
 
                 <p>SSID: {alerts[0].ssid}</p>
                 <p>BSSID: {alerts[0].bssid}</p>
@@ -156,6 +136,26 @@ function Dashboard() {
               </div>
             </div>
           )}
+
+          <section className="dashboard-security-alerts">
+            <div className="panel-header">
+              <h3>Backend Detection Alerts</h3>
+              <span>{activeSecurityAlerts.length} active</span>
+            </div>
+            {activeSecurityAlerts.length > 0 ? (
+              <div className="dashboard-security-alert-list">
+                {activeSecurityAlerts.slice(0, 5).map((alert) => (
+                  <article className="dashboard-security-alert" key={alert.id}>
+                    <strong>{alert.severity} · {alert.type.replaceAll("_", " ")}</strong>
+                    <span>{alert.ssid || "Hidden network"} · {alert.observedBssid}</span>
+                    <p>{alert.explanation}</p>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <p className="dashboard-no-security-alerts">No active backend detector alerts.</p>
+            )}
+          </section>
         </div>
       </div>
     </div>

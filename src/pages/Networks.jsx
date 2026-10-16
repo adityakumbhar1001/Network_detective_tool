@@ -1,30 +1,21 @@
-import { useEffect, useState } from "react";
 import { Wifi, ShieldCheck, AlertTriangle } from "lucide-react";
 
-import { getNetworks } from "../services/api";
+import { useWifiData } from "../useWifiData";
 
 function Networks() {
-  const [networks, setNetworks] = useState([]);
-
-  useEffect(() => {
-    async function loadNetworks() {
-      const data = await getNetworks();
-      setNetworks(data);
-    }
-
-    loadNetworks();
-  }, []);
+  const { networks, modeLabel } = useWifiData();
 
   function getStatus(network) {
     if (network.trusted) {
       return "Trusted";
     }
 
-    if (network.security === "Open") {
-      return "Suspicious";
-    }
+    if (network.suspicious) return "Suspicious";
+    if (network.securityStatus === "insecure") return "Insecure";
+    if (network.securityStatus === "weak") return "Weak encryption";
+    if (network.securityStatus === "unknown") return "Unknown";
 
-    return "Detected";
+    return "Encrypted";
   }
 
   return (
@@ -39,7 +30,7 @@ function Networks() {
 
         <div className="status-badge">
           <span></span>
-          DEMO MODE
+          {modeLabel}
         </div>
       </div>
 
@@ -69,7 +60,8 @@ function Networks() {
             <strong>
               {
                 networks.filter(
-                  (network) => network.security === "Open"
+                  (network) =>
+                    network.securityStatus !== "encrypted" || network.suspicious
                 ).length
               }
             </strong>

@@ -9,6 +9,7 @@ import Channels from "./pages/Channels";
 import SurveyHistory from "./pages/SurveyHistory";
 
 import Layout from "./components/Layout";
+import { WifiDataProvider } from "./WifiDataContext.jsx";
 
 function App() {
   const [activePage, setActivePage] = useState("Dashboard");
@@ -39,12 +40,14 @@ function App() {
   }
 
   return (
-    <Layout
-      activePage={activePage}
-      setActivePage={setActivePage}
-    >
-      {renderPage()}
-    </Layout>
+    <WifiDataProvider>
+      <Layout
+        activePage={activePage}
+        setActivePage={setActivePage}
+      >
+        {renderPage()}
+      </Layout>
+    </WifiDataProvider>
   );
 }
 

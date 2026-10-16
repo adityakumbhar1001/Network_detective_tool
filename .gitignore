@@ -11,7 +11,9 @@ node_modules
 dist
 dist-ssr
 *.local
-
+.wifi-shield-state.json
+esp32/wifi_shield_esp32/wifi_shield_config.h
+        
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

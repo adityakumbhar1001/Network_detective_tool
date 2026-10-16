@@ -1,19 +1,9 @@
-import { useEffect, useState } from "react";
 import { BarChart3, Wifi, Activity } from "lucide-react";
 
-import { getChannels } from "../services/api";
+import { useWifiData } from "../useWifiData";
 
 function Channels() {
-  const [channels, setChannels] = useState([]);
-
-  useEffect(() => {
-    async function loadChannels() {
-      const data = await getChannels();
-      setChannels(data);
-    }
-
-    loadChannels();
-  }, []);
+  const { channels, modeLabel } = useWifiData();
 
   const totalNetworks = channels.reduce(
     (total, channel) => total + channel.networks,
@@ -45,7 +35,7 @@ function Channels() {
 
         <div className="status-badge">
           <span></span>
-          DEMO MODE
+          {modeLabel}
         </div>
       </div>
 

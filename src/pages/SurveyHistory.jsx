@@ -1,52 +1,13 @@
-import { useEffect, useState } from "react";
 import {
   History,
   Wifi,
   AlertTriangle,
   Calendar,
 } from "lucide-react";
-
-const demoHistory = [
-  {
-    id: 1,
-    date: "26 Sep 2026",
-    time: "16:42",
-    networks: 5,
-    alerts: 1,
-    status: "Completed",
-  },
-  {
-    id: 2,
-    date: "26 Sep 2026",
-    time: "14:18",
-    networks: 4,
-    alerts: 0,
-    status: "Completed",
-  },
-  {
-    id: 3,
-    date: "25 Sep 2026",
-    time: "18:35",
-    networks: 6,
-    alerts: 1,
-    status: "Completed",
-  },
-  {
-    id: 4,
-    date: "25 Sep 2026",
-    time: "11:22",
-    networks: 3,
-    alerts: 0,
-    status: "Completed",
-  },
-];
+import { useWifiData } from "../useWifiData";
 
 function SurveyHistory() {
-  const [history, setHistory] = useState([]);
-
-  useEffect(() => {
-    setHistory(demoHistory);
-  }, []);
+  const { history, modeLabel } = useWifiData();
 
   const totalSurveys = history.length;
 
@@ -76,7 +37,7 @@ function SurveyHistory() {
 
         <div className="status-badge">
           <span></span>
-          DEMO MODE
+          {modeLabel}
         </div>
       </div>
 
@@ -217,21 +178,19 @@ function SurveyHistory() {
         <div className="history-info">
 
           <div>
-            <strong>Current Demo</strong>
+            <strong>ESP32 Scan API</strong>
 
             <p>
-              Survey records are currently generated from
-              frontend demo data.
+              Each accepted device scan updates the dashboard and creates a history record.
             </p>
           </div>
 
 
           <div>
-            <strong>Future ESP32 Integration</strong>
+            <strong>Connection Status</strong>
 
             <p>
-              The ESP32 can send survey results to the same
-              frontend API without changing this page.
+              {modeLabel} - the dashboard checks for new scans every three seconds.
             </p>
           </div>
 
@@ -240,8 +199,7 @@ function SurveyHistory() {
             <strong>Stored Results</strong>
 
             <p>
-              Future versions can store network scans,
-              timestamps, anomaly scores and locations.
+              Scan history is held in backend memory and clears when the backend restarts.
             </p>
           </div>
 
