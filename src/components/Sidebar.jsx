@@ -7,7 +7,19 @@ import {
   History,
 } from "lucide-react";
 
+import { useWifiData } from "../useWifiData";
+
+const CONNECTION_STATUS = {
+  live: { title: "ESP32 connected", detail: "Live scans every 15 s" },
+  stale: { title: "ESP32 stale", detail: "No scan in the last 30 s" },
+  waiting: { title: "Waiting for ESP32", detail: "API ready, no scan yet" },
+  demo: { title: "Demo Mode", detail: "API ready, no scan yet" },
+  offline: { title: "Demo Mode", detail: "API offline" },
+};
+
 function Sidebar({ activePage, setActivePage }) {
+  const { mode } = useWifiData();
+  const connection = CONNECTION_STATUS[mode] ?? CONNECTION_STATUS.offline;
   const menuItems = [
     {
       name: "Dashboard",
@@ -69,11 +81,11 @@ function Sidebar({ activePage, setActivePage }) {
 
       <div className="sidebar-footer">
         <div className="connection-status">
-          <span className="status-dot"></span>
+          <span className={`status-dot${mode === "live" ? " live" : ""}`}></span>
 
           <div>
-            <strong>Demo Mode</strong>
-            <small>ESP32 not connected</small>
+            <strong>{connection.title}</strong>
+            <small>{connection.detail}</small>
           </div>
         </div>
       </div>

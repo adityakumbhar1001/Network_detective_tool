@@ -3,7 +3,7 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
-#include <XPT2046_Touchscreen.h>
+#include <WiFiUdp.h>
 #include <esp_system.h>
 #include <new>
 #include <stdarg.h>
@@ -14,8 +14,8 @@
 #else
 #define WIFISHIELD_WIFI_SSID ""
 #define WIFISHIELD_WIFI_PASSWORD ""
-#define WIFISHIELD_API_URL "http://10.191.116.89:3001/api/scans"
-#define WIFISHIELD_SNAPSHOT_URL "http://10.191.116.89:3001/api/snapshot"
+#define WIFISHIELD_API_URL "http://:3001/api/scans"
+#define WIFISHIELD_SNAPSHOT_URL "http://:3001/api/snapshot"
 #define WIFISHIELD_DEVICE_TOKEN ""
 #endif
 
@@ -23,31 +23,75 @@
 #define WIFISHIELD_SNAPSHOT_URL ""
 #endif
 
-const char *WIFI_SSID = WIFISHIELD_WIFI_SSID;
-const char *WIFI_PASSWORD = WIFISHIELD_WIFI_PASSWORD;
+// Optional second network; whichever configured network is in range is used.
+#ifndef WIFISHIELD_WIFI_SSID_2
+#define WIFISHIELD_WIFI_SSID_2 ""
+#define WIFISHIELD_WIFI_PASSWORD_2 ""
+#endif
+
+// UDP port the backend answers discovery broadcasts on (same number as its HTTP port).
+#ifndef WIFISHIELD_DISCOVERY_PORT
+#define WIFISHIELD_DISCOVERY_PORT 3001
+#endif
+
+struct WifiCredential {
+  const char *ssid;
+  const char *password;
+};
+const WifiCredential WIFI_NETWORKS[] = {
+    {WIFISHIELD_WIFI_SSID, WIFISHIELD_WIFI_PASSWORD},
+    {WIFISHIELD_WIFI_SSID_2, WIFISHIELD_WIFI_PASSWORD_2},
+};
+const size_t WIFI_NETWORK_SLOTS = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
+size_t selectedWifiNetwork = 0;
 const char *DEVICE_ID = "esp32-wifi-shield-01";
 const char *API_URL = WIFISHIELD_API_URL;
 const char *SNAPSHOT_URL = WIFISHIELD_SNAPSHOT_URL;
 const char *DEVICE_TOKEN = WIFISHIELD_DEVICE_TOKEN;
 
-constexpr int TOUCH_CS_PIN = 4;
-constexpr int ALERT_LED_PIN = 25;
-constexpr int SPI_SCK_PIN = 18;
-constexpr int SPI_MISO_PIN = 19;
-constexpr int SPI_MOSI_PIN = 23;
+// The display uses the 8-bit parallel bus in tft_setup.h (GPIO32 is its RD line),
+// so the alert LED is on GPIO33.
+// No alert LED is fitted: GPIO33 is used for the battery level (below). To use an LED again,
+// put it on a free output pin and set this to that pin (-1 = no LED).
+constexpr int ALERT_LED_PIN = -1;
+
+// XPT2046 touch on its own SPI bus (HSPI); T_IRQ (GPIO34) is not needed for polling.
+constexpr int TOUCH_CS_PIN = 5;
+constexpr int TOUCH_SCK_PIN = 14;
+constexpr int TOUCH_MISO_PIN = 35;
+constexpr int TOUCH_MOSI_PIN = 13;
+
+// Battery level: the Li-ion cell's + terminal goes through a 1:2 divider (two equal
+// resistors, e.g. 100k + 100k) to GPIO33 (ADC1, works with Wi-Fi on; the former alert-LED
+// pin). GPIO34 (T_IRQ, unused) or GPIO36/39 would also work.
+constexpr int BATTERY_ADC_PIN = 33;
+constexpr float BATTERY_DIVIDER_RATIO = 2.0f;
+constexpr unsigned long BATTERY_SAMPLE_MS = 2000;
+constexpr float BATTERY_ABSENT_VOLTS = 2.5f;  // below this no cell is connected (USB power)
+
 constexpr uint8_t DISPLAY_ROTATION = 1;
-// Tune these raw corner readings for the installed touch panel.
-constexpr int TOUCH_RAW_X_MIN = 250;
-constexpr int TOUCH_RAW_X_MAX = 3850;
-constexpr int TOUCH_RAW_Y_MIN = 250;
-constexpr int TOUCH_RAW_Y_MAX = 3850;
+// Raw corner readings measured on the installed touch panel.
+constexpr int TOUCH_RAW_X_MIN = 300;
+constexpr int TOUCH_RAW_X_MAX = 3800;
+constexpr int TOUCH_RAW_Y_MIN = 200;
+constexpr int TOUCH_RAW_Y_MAX = 3800;
 // Flip these options if a calibration tap reports mirrored/swapped axes.
 constexpr bool TOUCH_SWAP_AXES = false;
 constexpr bool TOUCH_INVERT_X = false;
-constexpr bool TOUCH_INVERT_Y = false;
+constexpr bool TOUCH_INVERT_Y = true;
+// Touch sensitivity: minimum pressure (idle noise measured up to ~68, light press ~770).
+constexpr int TOUCH_Z_MIN = 100;
+// A read is accepted only if its 3 samples per axis agree within this many raw counts.
+constexpr int TOUCH_MAX_SPREAD = 60;
 
 const unsigned long SCAN_INTERVAL_MS = 15000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+const unsigned long WIFI_RESELECT_MS = 30000;
+const unsigned long DISCOVERY_RETRY_MS = 10000;
+const unsigned long DISCOVERY_REPLY_WAIT_MS = 700;
+// Restart instead of running on with a heap too small for the backend task (12 KB stack).
+const size_t MIN_LARGEST_FREE_BLOCK = 24576;
+const uint8_t MAX_TASK_CREATE_FAILURES = 3;
 const unsigned long SCAN_RETRY_DELAY_MS = 5000;
 const unsigned long TOUCH_DEBOUNCE_MS = 180;
 const unsigned long STARTUP_DIAGNOSTIC_MS = 1500;
@@ -58,7 +102,13 @@ const size_t NETWORKS_PER_PAGE = 3;
 const size_t SNAPSHOT_DOCUMENT_CAPACITY = 131072;
 
 TFT_eSPI tft = TFT_eSPI();
-XPT2046_Touchscreen touch(TOUCH_CS_PIN);
+SPIClass touchSpi(HSPI);
+
+struct TouchSample {
+  int x;
+  int y;
+  int z;
+};
 SemaphoreHandle_t dataMutex;
 TaskHandle_t apiTaskHandle = nullptr;
 
@@ -71,6 +121,8 @@ struct NetworkRecord {
   int channel;
   bool trusted;
   bool suspicious;
+  bool current;  // heard in the latest scan (false: kept from the last 60 s)
+  int apCount;   // access points sharing this name, collapsed into one card
 };
 
 struct AlertRecord {
@@ -124,11 +176,16 @@ bool scanInProgress = false;
 bool scanRetryPending = false;
 volatile bool wifiConnectPending = false;
 bool touchWasDown = false;
+// Set while redrawing in place: the status bar and footer are unchanged and skipped,
+// and the screen is not cleared, so nothing visibly blinks.
+bool inPlaceRefresh = false;
 bool startupDiagnosticVisible = true;
 unsigned long lastScanStart = 0;
 unsigned long scanRetryAfter = 0;
 unsigned long activeWifiScanStartedAt = 0;
 unsigned long lastWifiAttempt = 0;
+unsigned long lastDiscoveryAttempt = 0;
+uint8_t taskCreateFailures = 0;
 unsigned long lastTouchMillis = 0;
 unsigned long startupDiagnosticStarted = 0;
 String lastStatusSignature;
@@ -494,30 +551,116 @@ String securityStatusLabel(const String &status) {
   return "Unknown";
 }
 
-String getSecurityStatus(const String &security) {
+// Same rules as the backend's getSecurityStatus(). The cipher decides mixed modes:
+// WPA/WPA2 with AES (CCMP) only is as strong as WPA2; with TKIP allowed it is weak.
+String getSecurityStatus(const String &security, bool cipherKnown, bool usesTkip) {
   if (security == "Open") return "insecure";
-  if (security == "WEP" || security == "WPA" || security == "WPA/WPA2") return "weak";
-  if (security == "WPA2" || security == "WPA3" || security == "WPA2/WPA3") {
-    return "encrypted";
-  }
+  if (security == "WEP" || security == "WPA") return "weak";
+  if (security == "WPA/WPA2") return cipherKnown && !usesTkip ? "encrypted" : "weak";
+  if (security == "WPA2") return usesTkip ? "weak" : "encrypted";
+  if (security == "WPA3" || security == "WPA2/WPA3" || security == "OWE") return "encrypted";
   return "unknown";
 }
 
+const char *cipherName(wifi_cipher_type_t cipher) {
+  switch (cipher) {
+    case WIFI_CIPHER_TYPE_NONE: return "None";
+    case WIFI_CIPHER_TYPE_WEP40: return "WEP40";
+    case WIFI_CIPHER_TYPE_WEP104: return "WEP104";
+    case WIFI_CIPHER_TYPE_TKIP: return "TKIP";
+    case WIFI_CIPHER_TYPE_CCMP: return "CCMP";
+    case WIFI_CIPHER_TYPE_TKIP_CCMP: return "TKIP/CCMP";
+    case WIFI_CIPHER_TYPE_GCMP: return "GCMP";
+    case WIFI_CIPHER_TYPE_GCMP256: return "GCMP256";
+    default: return "Unknown";
+  }
+}
+
+// Scan result record for a network (pairwise/group cipher), or nullptr if unavailable.
+const wifi_ap_record_t *scanRecord(int index) {
+  return static_cast<const wifi_ap_record_t *>(WiFi.getScanInfoByIndex(index));
+}
+
+bool cipherAllowsTkip(wifi_cipher_type_t cipher) {
+  return cipher == WIFI_CIPHER_TYPE_TKIP || cipher == WIFI_CIPHER_TYPE_TKIP_CCMP;
+}
+
+// "http://host:port" of the backend. Starts from the configured URL and is replaced by
+// LAN discovery, so the firmware keeps working when the PC's IP or network changes.
+String apiBaseUrl;
+volatile bool backendDiscoveryNeeded = true;
+
+String baseUrlFrom(const char *url) {
+  String base = url;
+  const int apiPath = base.indexOf("/api/");
+  if (apiPath >= 0) base.remove(apiPath);
+  return base;
+}
+
+String getScansUrl() {
+  return apiBaseUrl + "/api/scans";
+}
+
 String getSnapshotUrl(bool displayOnly = false) {
-  String url;
-  if (SNAPSHOT_URL[0] != '\0') {
-    url = String(SNAPSHOT_URL);
-  } else {
-    url = API_URL;
-    const int scanPath = url.lastIndexOf("/api/scans");
-    if (scanPath >= 0) {
-      url.remove(scanPath);
-      url += "/api/snapshot";
+  String url = apiBaseUrl + "/api/snapshot";
+  if (displayOnly) url += "?display=1";
+  return url;
+}
+
+// Broadcasts WIFISHIELD_DISCOVER on the LAN; the backend replies "WIFISHIELD_API <port>"
+// and its sender address becomes the API host. Call only when no backend task is running.
+bool discoverBackend() {
+  WiFiUDP udp;
+  if (!udp.begin(WIFISHIELD_DISCOVERY_PORT + 1)) {
+    diagnosticLog("WARN", activeScanCycleId, "DISCOVERY", "UDP socket unavailable; keeping %s",
+                  apiBaseUrl.c_str());
+    return false;
+  }
+  const IPAddress local = WiFi.localIP();
+  const IPAddress mask = WiFi.subnetMask();
+  IPAddress broadcast;
+  for (int octet = 0; octet < 4; octet++) broadcast[octet] = local[octet] | ~mask[octet];
+
+  for (int attempt = 0; attempt < 2; attempt++) {
+    udp.beginPacket(broadcast, WIFISHIELD_DISCOVERY_PORT);
+    udp.print("WIFISHIELD_DISCOVER");
+    udp.endPacket();
+    const unsigned long sentAt = millis();
+    while (millis() - sentAt < DISCOVERY_REPLY_WAIT_MS) {
+      if (udp.parsePacket() > 0) {
+        char reply[48] = {0};
+        udp.read(reply, sizeof(reply) - 1);
+        int port = 0;
+        if (sscanf(reply, "WIFISHIELD_API %d", &port) == 1 && port > 0 && port < 65536) {
+          const String found = "http://" + udp.remoteIP().toString() + ":" + String(port);
+          diagnosticLog("INFO", activeScanCycleId, "DISCOVERY", "backend found at %s%s",
+                        found.c_str(), found == apiBaseUrl ? "" : " (API address updated)");
+          apiBaseUrl = found;
+          backendDiscoveryNeeded = false;
+          udp.stop();
+          snapshotChanged = true;  // Settings screen shows the API address
+          return true;
+        }
+      }
+      delay(10);
     }
   }
+  udp.stop();
+  diagnosticLog("WARN", activeScanCycleId, "DISCOVERY",
+                "no backend reply on UDP %d; keeping %s; retry in %lu s",
+                WIFISHIELD_DISCOVERY_PORT, apiBaseUrl.c_str(), DISCOVERY_RETRY_MS / 1000);
+  return false;
+}
 
-  if (displayOnly) url += url.indexOf('?') >= 0 ? "&display=1" : "?display=1";
-  return url;
+void restartIfMemoryExhausted(const char *where) {
+  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  if (largest >= MIN_LARGEST_FREE_BLOCK && taskCreateFailures < MAX_TASK_CREATE_FAILURES) return;
+  diagnosticLog("ERROR", activeScanCycleId, "MEMORY_GUARD",
+                "%s: largest-block=%u free-heap=%u task-create-failures=%u; restarting",
+                where, static_cast<unsigned>(largest), static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(taskCreateFailures));
+  delay(200);
+  ESP.restart();
 }
 
 String getAlertsUrl() {
@@ -558,7 +701,79 @@ void drawStartupDiagnostic() {
       width / 2, height / 2 + 20, 1);
 }
 
+float batteryVolts = 0;
+int batteryPercent = -1;  // -1 = no cell detected (running from USB)
+unsigned long lastBatterySample = 0;
+bool batteryPrimed = false;
+
+int batteryPercentFromVolts(float volts) {
+  // Typical Li-ion discharge curve under light load (voltage, percent).
+  static const float curve[][2] = {
+      {3.00f, 0}, {3.50f, 5}, {3.65f, 15}, {3.72f, 25}, {3.78f, 40},
+      {3.84f, 55}, {3.92f, 68}, {4.00f, 80}, {4.10f, 92}, {4.20f, 100}};
+  constexpr size_t points = sizeof(curve) / sizeof(curve[0]);
+  if (volts <= curve[0][0]) return 0;
+  if (volts >= curve[points - 1][0]) return 100;
+  for (size_t index = 1; index < points; index++) {
+    if (volts <= curve[index][0]) {
+      const float span = curve[index][0] - curve[index - 1][0];
+      const float fraction = (volts - curve[index - 1][0]) / span;
+      return static_cast<int>(curve[index - 1][1] +
+                              fraction * (curve[index][1] - curve[index - 1][1]) + 0.5f);
+    }
+  }
+  return 100;
+}
+
+// Small battery icon + percentage in the status bar's top-right corner.
+void drawBatteryIndicator() {
+  const int width = tft.width();
+  const uint16_t background = color(15, 23, 42);
+  tft.fillRect(width - 66, 2, 64, 15, background);
+  tft.setTextFont(1);
+  tft.setTextDatum(TL_DATUM);
+  if (batteryPercent < 0) {
+    tft.setTextColor(color(148, 163, 184), background);
+    tft.drawRightString("USB", width - 7, 6, 1);
+    return;
+  }
+  const uint16_t levelColor = batteryPercent >= 40 ? color(74, 222, 128)
+                            : batteryPercent >= 20 ? color(251, 191, 36)
+                                                   : color(248, 113, 113);
+  const int iconX = width - 62;
+  tft.drawRect(iconX, 4, 22, 11, levelColor);
+  tft.fillRect(iconX + 22, 7, 2, 5, levelColor);
+  const int fillWidth = (batteryPercent * 18 + 50) / 100;
+  if (fillWidth > 0) tft.fillRect(iconX + 2, 6, fillWidth, 7, levelColor);
+  tft.setTextColor(levelColor, background);
+  tft.drawRightString(String(batteryPercent) + "%", width - 7, 6, 1);
+}
+
+// Averages 16 ADC reads (calibrated millivolts), smooths over time, and redraws only the
+// small battery area when the shown percentage changes by 2% or more.
+void updateBattery(bool force = false) {
+  const unsigned long now = millis();
+  if (!force && now - lastBatterySample < BATTERY_SAMPLE_MS) return;
+  lastBatterySample = now;
+  uint32_t totalMillivolts = 0;
+  for (int sample = 0; sample < 16; sample++) totalMillivolts += analogReadMilliVolts(BATTERY_ADC_PIN);
+  const float measured = totalMillivolts / 16.0f / 1000.0f * BATTERY_DIVIDER_RATIO;
+  const int previousPercent = batteryPercent;
+  if (measured < BATTERY_ABSENT_VOLTS) {
+    batteryVolts = 0;
+    batteryPercent = -1;
+    batteryPrimed = false;
+  } else {
+    batteryVolts = batteryPrimed ? batteryVolts * 0.8f + measured * 0.2f : measured;
+    batteryPrimed = true;
+    const int percent = batteryPercentFromVolts(batteryVolts);
+    if (previousPercent < 0 || abs(percent - previousPercent) >= 2) batteryPercent = percent;
+  }
+  if (batteryPercent != previousPercent && !startupDiagnosticVisible) drawBatteryIndicator();
+}
+
 void drawStatusBar() {
+  if (inPlaceRefresh) return;  // its content is part of the layout signature: unchanged
   const int width = tft.width();
   tft.fillRect(0, 0, width, 38, color(15, 23, 42));
   tft.setTextDatum(TL_DATUM);
@@ -578,13 +793,18 @@ void drawStatusBar() {
   tft.setTextColor(wifiConnected ? color(74, 222, 128) : color(248, 113, 113), color(15, 23, 42));
   tft.drawRightString(clippedText(status, 39), width - 7, 20, 1);
   tft.drawFastHLine(7, 36, width - 14, color(51, 65, 85));
+  drawBatteryIndicator();
 }
 
 void drawWifiIcon(int centerX, int centerY, uint16_t iconColor) {
-  tft.drawArc(centerX, centerY, 20, 18, 225, 315, iconColor, TFT_BLACK);
-  tft.drawArc(centerX, centerY, 13, 11, 225, 315, iconColor, TFT_BLACK);
-  tft.drawArc(centerX, centerY, 6, 4, 225, 315, iconColor, TFT_BLACK);
-  tft.fillCircle(centerX, centerY + 12, 3, iconColor);
+  // TFT_eSPI arc angles: 0 = 6 o'clock, clockwise, so 135..225 is the upper quarter.
+  // All arcs share the dot's centre, which sits at the bottom of the fan.
+  const int dotY = centerY + 12;
+  const uint16_t tileColor = color(30, 41, 59);  // drawFeatureTile background, for smooth edges
+  tft.drawArc(centerX, dotY, 22, 20, 135, 225, iconColor, tileColor);
+  tft.drawArc(centerX, dotY, 15, 13, 135, 225, iconColor, tileColor);
+  tft.drawArc(centerX, dotY, 8, 6, 135, 225, iconColor, tileColor);
+  tft.fillCircle(centerX, dotY, 3, iconColor);
 }
 
 void drawAlertIcon(int centerX, int centerY, uint16_t iconColor) {
@@ -649,8 +869,10 @@ void drawHomeScreen() {
   const int secondY = firstY + tileHeight + gap;
   drawFeatureTile(margin, firstY, tileWidth, tileHeight, "NETWORKS",
                   color(56, 189, 248), 0);
-  drawFeatureTile(margin + tileWidth + gap, firstY, tileWidth, tileHeight, "ALERTS",
-                  color(251, 146, 60), 1);
+  // Red with a count when High/Critical findings are active, so they are visible from Home.
+  const String alertsLabel = activeAlertCount ? "ALERTS (" + String(activeAlertCount) + ")" : "ALERTS";
+  drawFeatureTile(margin + tileWidth + gap, firstY, tileWidth, tileHeight, alertsLabel.c_str(),
+                  highPriorityAlertCount ? color(248, 113, 113) : color(251, 146, 60), 1);
   drawFeatureTile(margin, secondY, tileWidth, tileHeight, "SECURITY",
                   color(74, 222, 128), 2);
   drawFeatureTile(margin + tileWidth + gap, secondY, tileWidth, tileHeight, "SETTINGS",
@@ -668,6 +890,7 @@ void drawHomeScreen() {
 }
 
 void drawFooter(size_t page, size_t pageCount) {
+  if (inPlaceRefresh) return;  // page/page count are part of the layout signature: unchanged
   const int width = tft.width();
   const int height = tft.height();
   const int buttonY = height - 34;
@@ -721,14 +944,36 @@ void drawNetworkScreen() {
     for (size_t index = start; index < networkCount && index < start + NETWORKS_PER_PAGE; index++) {
       const NetworkRecord &network = networks[index];
       const int rowY = 57 + static_cast<int>(index - start) * 49;
-      tft.fillRoundRect(7, rowY, width - 14, 45, 7, color(30, 41, 59));
+      const uint16_t card = color(30, 41, 59);
+      tft.fillRoundRect(7, rowY, width - 14, 45, 7, card);
+      tft.setTextDatum(TL_DATUM);
       tft.setTextFont(2);
-      tft.setTextColor(TFT_WHITE, color(30, 41, 59));
+      tft.setTextColor(TFT_WHITE, card);
       String ssid = network.ssid.length() ? network.ssid : "(hidden)";
-      tft.drawString(clippedText(ssid, 25), 13, rowY + 5);
+      tft.drawString(clippedText(ssid, 22), 13, rowY + 5);
+
+      // Verdict badge: trust/suspicion first, then the backend's security status.
+      const char *badge = "UNKNOWN";
+      uint16_t badgeColor = color(148, 163, 184);
+      if (network.suspicious) { badge = "SUSPICIOUS"; badgeColor = color(248, 113, 113); }
+      else if (network.trusted) { badge = "TRUSTED"; badgeColor = color(56, 189, 248); }
+      else if (network.securityStatus == "encrypted") { badge = "SECURE"; badgeColor = color(74, 222, 128); }
+      else if (network.securityStatus == "weak") { badge = "WEAK"; badgeColor = color(251, 191, 36); }
+      else if (network.securityStatus == "insecure") { badge = "OPEN"; badgeColor = color(248, 113, 113); }
+      else if (network.securityStatus == "portal") { badge = "PORTAL"; badgeColor = color(96, 165, 250); }
+      tft.setTextDatum(TR_DATUM);
+      tft.setTextColor(badgeColor, card);
+      tft.drawString(badge, width - 15, rowY + 5);
+      tft.setTextDatum(TL_DATUM);
+
       tft.setTextFont(1);
-      tft.setTextColor(color(148, 163, 184), color(30, 41, 59));
-      tft.drawString(String(network.rssi) + " dBm", 13, rowY + 27);
+      tft.setTextColor(network.current ? color(203, 213, 225) : color(100, 116, 139), card);
+      String details = String(network.rssi) + " dBm  ch " + String(network.channel) + "  " +
+                       network.security;
+      if (network.securityStatus == "portal") details += " +login";
+      if (network.apCount > 1) details += "  x" + String(network.apCount) + " APs";
+      if (!network.current) details += "  (not in last scan)";
+      tft.drawString(clippedText(details, 48), 13, rowY + 29);
     }
   }
   if (snapshotStatus == "STALE") {
@@ -819,12 +1064,14 @@ void drawSecurityScreen() {
   size_t encrypted = 0;
   size_t weak = 0;
   size_t open = 0;
+  size_t portal = 0;
   size_t unknown = 0;
   for (size_t index = 0; index < networkCount; index++) {
     const String &status = networks[index].securityStatus;
     if (status == "encrypted") encrypted++;
     else if (status == "weak") weak++;
     else if (status == "insecure") open++;
+    else if (status == "portal") portal++;
     else unknown++;
   }
   tft.setTextDatum(TL_DATUM);
@@ -835,29 +1082,31 @@ void drawSecurityScreen() {
   tft.setTextColor(color(74, 222, 128), TFT_BLACK);
   tft.drawString("Encrypted  " + String(encrypted), 14, 75);
   tft.setTextColor(color(251, 191, 36), TFT_BLACK);
-  tft.drawString("Weak  " + String(weak) + "     Open  " + String(open), 14, 95);
+  tft.drawString("Weak  " + String(weak) + "   Open  " + String(open) + "   Portal  " + String(portal), 14, 95);
   tft.setTextColor(color(148, 163, 184), TFT_BLACK);
   tft.drawString("Unknown  " + String(unknown) + "     Networks  " + String(networkCount), 14, 115);
   tft.setTextFont(2);
   tft.setTextColor(color(203, 213, 225), TFT_BLACK);
   tft.drawString("Active backend findings", 10, 143);
+  // Font 1 is 6 x 8 px: lines must stay under ~52 characters and end above the
+  // footer, which starts at height - 40.
   tft.setTextFont(1);
   if (alertDataAvailable) {
     tft.setTextColor(color(248, 113, 113), TFT_BLACK);
-    tft.drawString("Critical " + String(criticalAlertCount) + "   High " + String(highAlertCount), 14, 169);
+    tft.drawString("Critical " + String(criticalAlertCount) + "  High " + String(highAlertCount), 14, 165);
     tft.setTextColor(color(251, 191, 36), TFT_BLACK);
-    tft.drawString("Medium " + String(mediumAlertCount) + "   Low " + String(lowAlertCount), 14, 187);
+    tft.drawString("Medium " + String(mediumAlertCount) + "  Low " + String(lowAlertCount), 170, 165);
   } else {
     tft.setTextColor(color(248, 113, 113), TFT_BLACK);
-    tft.drawString("Alert data unavailable", 14, 169);
+    tft.drawString("Alert data unavailable", 14, 165);
   }
   tft.setTextColor(color(148, 163, 184), TFT_BLACK);
-  tft.drawCentreString("Backend heuristics are warnings, not attack confirmation.",
-                       width / 2, height - 54, 1);
+  tft.drawCentreString("Heuristic warnings, not confirmed attacks",
+                       width / 2, height - 63, 1);
   if (!backendReachable) {
     tft.setTextColor(color(248, 113, 113), TFT_BLACK);
-    tft.drawCentreString("Security status unavailable; showing cached data",
-                         width / 2, height - 43, 1);
+    tft.drawCentreString("Backend offline; showing cached data",
+                         width / 2, height - 51, 1);
   }
   drawFooter(0, 1);
 }
@@ -886,15 +1135,120 @@ void drawSettingsScreen() {
   drawFooter(0, 1);
 }
 
-void renderCurrentScreen() {
-  const bool renderingCycleUpdate = scanCycleWaitingForDisplay;
+uint32_t hashMix(uint32_t hash, uint32_t value) {
+  for (int shift = 0; shift < 32; shift += 8) {
+    hash ^= (value >> shift) & 0xFF;
+    hash *= 16777619UL;  // FNV-1a
+  }
+  return hash;
+}
+
+uint32_t hashMix(uint32_t hash, const String &value) {
+  for (size_t index = 0; index < value.length(); index++) {
+    hash ^= static_cast<uint8_t>(value[index]);
+    hash *= 16777619UL;
+  }
+  return hashMix(hash, value.length());
+}
+
+// Fingerprint of what the current screen draws. With includeContent=false it covers
+// only the layout (what is drawn where), not values that are redrawn in place
+// (network names/RSSI, alert text). Call with dataMutex held.
+uint32_t displaySignature(bool includeContent) {
+  uint32_t hash = 2166136261UL;
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  hash = hashMix(hash, static_cast<uint32_t>(currentScreen));
+  hash = hashMix(hash, wifiConnected);
+  hash = hashMix(hash, backendReachable);
+  hash = hashMix(hash, snapshotStatus);
+  switch (currentScreen) {
+    case SCREEN_HOME:
+      hash = hashMix(hash, networkCount);
+      hash = hashMix(hash, alertDataAvailable);
+      hash = hashMix(hash, activeAlertCount);
+      hash = hashMix(hash, highPriorityAlertCount);
+      break;
+    case SCREEN_NETWORKS: {
+      hash = hashMix(hash, networkCount);
+      hash = hashMix(hash, networkPage);
+      if (!includeContent) break;
+      const size_t start = networkPage * NETWORKS_PER_PAGE;
+      for (size_t index = start; index < networkCount && index < start + NETWORKS_PER_PAGE; index++) {
+        const NetworkRecord &network = networks[index];
+        hash = hashMix(hash, network.ssid);
+        hash = hashMix(hash, static_cast<uint32_t>(network.rssi));
+        hash = hashMix(hash, static_cast<uint32_t>(network.channel));
+        hash = hashMix(hash, network.security);
+        hash = hashMix(hash, network.securityStatus);
+        hash = hashMix(hash, (network.current ? 1U : 0U) | (network.trusted ? 2U : 0U) |
+                                 (network.suspicious ? 4U : 0U));
+      }
+      break;
+    }
+    case SCREEN_ALERTS:
+      hash = hashMix(hash, alertDataAvailable);
+      hash = hashMix(hash, activeAlertCount);
+      hash = hashMix(hash, securityAlertCount);
+      hash = hashMix(hash, alertPage);
+      if (includeContent && securityAlertCount) {
+        const AlertRecord &alert = securityAlerts[min(alertPage, securityAlertCount - 1)];
+        hash = hashMix(hash, alert.severity);
+        hash = hashMix(hash, alert.type);
+        hash = hashMix(hash, alert.hasRiskScore ? static_cast<uint32_t>(alert.riskScore) : 0xFFFFFFFFUL);
+        hash = hashMix(hash, alert.ssid);
+        hash = hashMix(hash, alert.observedBssid);
+        hash = hashMix(hash, alert.trustedBssid);
+        hash = hashMix(hash, alert.evidence);
+        hash = hashMix(hash, alert.explanation);
+        hash = hashMix(hash, alert.status);
+      }
+      break;
+    case SCREEN_SECURITY:
+      hash = hashMix(hash, networkCount);
+      for (size_t index = 0; index < networkCount; index++) {
+        hash = hashMix(hash, networks[index].securityStatus);
+      }
+      hash = hashMix(hash, alertDataAvailable);
+      hash = hashMix(hash, criticalAlertCount);
+      hash = hashMix(hash, highAlertCount);
+      hash = hashMix(hash, mediumAlertCount);
+      hash = hashMix(hash, lowAlertCount);
+      break;
+    case SCREEN_SETTINGS:
+      hash = hashMix(hash, static_cast<uint32_t>(WiFi.localIP()));
+      hash = hashMix(hash, apiBaseUrl);
+      break;
+  }
+  return hash;
+}
+
+uint32_t lastRenderedSignature = 0;
+uint32_t lastRenderedLayoutSignature = 0;
+bool lastRenderedSignatureValid = false;
+
+void completeScanCycleDisplay(bool redrawn) {
+  if (!scanCycleWaitingForDisplay) return;
   const uint32_t cycleId = activeScanCycleId;
-  if (renderingCycleUpdate) {
-    diagnosticLog("INFO", cycleId, "TFT_UPDATE", "start screen=%d",
-                  static_cast<int>(currentScreen));
+  diagnosticLog("INFO", cycleId, "TFT_UPDATE", redrawn ? "complete screen=%d"
+                : "skipped screen=%d; displayed content unchanged",
+                static_cast<int>(currentScreen));
+  scanCycleWaitingForDisplay = false;
+  scanCycleActive = false;
+  diagnosticLog("INFO", cycleId, "SCAN_CYCLE",
+                "complete duration=%lu ms networks=%u active-alerts=%u",
+                millis() - activeScanCycleStartedAt,
+                static_cast<unsigned>(networkCount),
+                static_cast<unsigned>(activeAlertCount));
+}
+
+void drawCurrentScreen(bool inPlace) {
+  if (scanCycleWaitingForDisplay) {
+    diagnosticLog("INFO", activeScanCycleId, "TFT_UPDATE", "start screen=%d%s",
+                  static_cast<int>(currentScreen), inPlace ? " in place" : "");
   }
   if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
-  tft.fillScreen(color(2, 6, 23));
+  inPlaceRefresh = inPlace;
+  if (!inPlace) tft.fillScreen(color(2, 6, 23));
   switch (currentScreen) {
     case SCREEN_HOME: drawHomeScreen(); break;
     case SCREEN_NETWORKS: drawNetworkScreen(); break;
@@ -902,18 +1256,33 @@ void renderCurrentScreen() {
     case SCREEN_SECURITY: drawSecurityScreen(); break;
     case SCREEN_SETTINGS: drawSettingsScreen(); break;
   }
+  inPlaceRefresh = false;
+  lastRenderedSignature = displaySignature(true);
+  lastRenderedLayoutSignature = displaySignature(false);
+  lastRenderedSignatureValid = true;
   if (dataMutex) xSemaphoreGive(dataMutex);
-  if (renderingCycleUpdate) {
-    diagnosticLog("INFO", cycleId, "TFT_UPDATE", "complete screen=%d",
-                  static_cast<int>(currentScreen));
-    scanCycleWaitingForDisplay = false;
-    scanCycleActive = false;
-    diagnosticLog("INFO", cycleId, "SCAN_CYCLE",
-                  "complete duration=%lu ms networks=%u active-alerts=%u",
-                  millis() - activeScanCycleStartedAt,
-                  static_cast<unsigned>(networkCount),
-                  static_cast<unsigned>(activeAlertCount));
+  completeScanCycleDisplay(true);
+}
+
+// Always redraws from a cleared screen; used for navigation (touch) and the first frame.
+void renderCurrentScreen() {
+  drawCurrentScreen(false);
+}
+
+// Data-driven refresh. Clearing the whole screen shows as a flicker, so: skip the
+// redraw when nothing displayed changed, and when only values changed within the same
+// layout (e.g. RSSI), redraw in place over the existing cards without clearing.
+void refreshCurrentScreenIfChanged() {
+  if (dataMutex) xSemaphoreTake(dataMutex, portMAX_DELAY);
+  const bool unchanged = lastRenderedSignatureValid && displaySignature(true) == lastRenderedSignature;
+  const bool sameLayout = lastRenderedSignatureValid &&
+      displaySignature(false) == lastRenderedLayoutSignature;
+  if (dataMutex) xSemaphoreGive(dataMutex);
+  if (unchanged) {
+    completeScanCycleDisplay(false);
+    return;
   }
+  drawCurrentScreen(sameLayout);
 }
 
 void setLocalScanResults(int found) {
@@ -926,9 +1295,14 @@ void setLocalScanResults(int found) {
     networks[index].rssi = WiFi.RSSI(index);
     networks[index].channel = WiFi.channel(index);
     networks[index].security = securityName(WiFi.encryptionType(index));
-    networks[index].securityStatus = getSecurityStatus(networks[index].security);
+    const wifi_ap_record_t *record = scanRecord(index);
+    networks[index].securityStatus = getSecurityStatus(
+        networks[index].security, record != nullptr,
+        record && (cipherAllowsTkip(record->pairwise_cipher) || cipherAllowsTkip(record->group_cipher)));
     networks[index].trusted = false;
     networks[index].suspicious = false;
+    networks[index].current = true;
+    networks[index].apCount = 1;
   }
   if (dataMutex) xSemaphoreGive(dataMutex);
   snapshotChanged = true;
@@ -994,8 +1368,11 @@ void populateAlertData(JsonArray sourceAlerts, uint32_t cycleId) {
     }
   }
   alertDataAvailable = true;
+  if (alertPage >= max(static_cast<size_t>(1), securityAlertCount)) {
+    alertPage = securityAlertCount ? securityAlertCount - 1 : 0;
+  }
   if (dataMutex) xSemaphoreGive(dataMutex);
-  digitalWrite(ALERT_LED_PIN, highPriorityAlertCount ? HIGH : LOW);
+  if (ALERT_LED_PIN >= 0) digitalWrite(ALERT_LED_PIN, highPriorityAlertCount ? HIGH : LOW);
   snapshotChanged = true;
   diagnosticLog("INFO", cycleId, "JSON_ALERTS",
                 "loaded=%u active=%u critical=%u high=%u medium=%u low=%u LED=%s",
@@ -1054,6 +1431,8 @@ bool populateSnapshot(DynamicJsonDocument &snapshot, uint32_t cycleId,
     target.securityStatus = jsonText(network["securityStatus"], "unknown");
     target.trusted = network["trusted"] | false;
     target.suspicious = network["suspicious"] | false;
+    target.current = network["seenInLatestScan"] | true;
+    target.apCount = network["apCount"] | 1;
   }
 
   scannedAt = jsonText(snapshot["scannedAt"]);
@@ -1061,8 +1440,10 @@ bool populateSnapshot(DynamicJsonDocument &snapshot, uint32_t cycleId,
   snapshotStatus = status == "stale" ? "STALE" :
       status == "live" ? "LIVE" : "WAITING";
   backendReachable = true;
-  networkPage = 0;
-  alertPage = 0;
+  // Keep the page the user is viewing; only clamp it if the list became shorter.
+  const size_t networkPages = max(static_cast<size_t>(1),
+      (networkCount + NETWORKS_PER_PAGE - 1) / NETWORKS_PER_PAGE);
+  if (networkPage >= networkPages) networkPage = networkPages - 1;
   if (dataMutex) xSemaphoreGive(dataMutex);
   diagnosticLog("INFO", cycleId, "JSON_SNAPSHOT",
                 "snapshot applied network count=%u scannedAt=%s receivedAt=%s status=%s",
@@ -1174,6 +1555,10 @@ String makeScanPayload(size_t count, uint32_t cycleId) {
     network["rssi"] = WiFi.RSSI(index);
     network["channel"] = WiFi.channel(index);
     network["security"] = securityName(WiFi.encryptionType(index));
+    if (const wifi_ap_record_t *record = scanRecord(index)) {
+      network["pairwiseCipher"] = cipherName(record->pairwise_cipher);
+      network["groupCipher"] = cipherName(record->group_cipher);
+    }
   }
   if (document.overflowed()) {
     diagnosticError(cycleId, "SCAN_PAYLOAD",
@@ -1243,8 +1628,7 @@ void inspectPostResponse(const String &body, uint32_t cycleId, int statusCode) {
                 document["networks"] | -1);
 }
 
-void backendTask(void *parameter) {
-  ScanRequest *request = static_cast<ScanRequest *>(parameter);
+void runBackendRequest(ScanRequest *request) {
   const uint32_t cycleId = request->cycleId;
   diagnosticLog("INFO", cycleId, "HTTP_POST_SCANS",
                 "cycle enters backend task after scan; networks=%u payload-bytes=%u",
@@ -1257,7 +1641,7 @@ void backendTask(void *parameter) {
   String postContentType;
   int statusCode = -1;
   const bool postSucceeded = performHttpRequest(
-      postClient, "POST_SCANS", String(API_URL), &request->payload,
+      postClient, "POST_SCANS", getScansUrl(), &request->payload,
       request->networkCount, HTTP_CODE_CREATED, cycleId,
       postBody, postContentType, statusCode, DEVICE_TOKEN);
   if (postSucceeded) {
@@ -1281,6 +1665,7 @@ void backendTask(void *parameter) {
   bool snapshotApplied = false;
   if (!snapshotRequestSucceeded) {
     setBackendState(false, "OFFLINE");
+    backendDiscoveryNeeded = true;  // the PC may have a new IP; look for it again
   } else if (!snapshotBody.length()) {
     diagnosticError(cycleId, "JSON_SNAPSHOT",
                     "HTTP response body length=0; JSON parsing skipped",
@@ -1349,6 +1734,14 @@ void backendTask(void *parameter) {
                 "backend stages finished; POST success=%s HTTP_POST=%d; snapshot success=%s HTTP_SNAPSHOT=%d",
                 postSucceeded ? "yes" : "no", statusCode,
                 snapshotRequestSucceeded ? "yes" : "no", snapshotCode);
+}
+
+void backendTask(void *parameter) {
+  ScanRequest *request = static_cast<ScanRequest *>(parameter);
+  // vTaskDelete() never returns, so destructors of locals in this function never run.
+  // The work (HTTP clients, ~25 KB response bodies) lives in runBackendRequest() so it
+  // is freed on return; previously ~30 KB leaked per cycle until xTaskCreate failed.
+  runBackendRequest(request);
   delete request;
   apiTaskHandle = nullptr;
   vTaskDelete(nullptr);
@@ -1409,6 +1802,8 @@ void startBackendRequest(size_t count, uint32_t cycleId,
   if (xTaskCreate(backendTask, "wifiBackend", 12288, request, 1, &apiTaskHandle) != pdPASS) {
     delete request;
     apiTaskHandle = nullptr;
+    taskCreateFailures++;
+    restartIfMemoryExhausted("backend task creation");
     diagnosticError(cycleId, "BACKEND_TASK",
                     "xTaskCreate returned failure for wifiBackend (stack=12288 bytes)",
                     "confirmed backend task creation failure",
@@ -1424,6 +1819,7 @@ void startBackendRequest(size_t count, uint32_t cycleId,
     finishCycleWithoutDisplay(cycleId, "backend task creation failed");
     return;
   }
+  taskCreateFailures = 0;
   if (queuedPayload) {
     pendingScanPayload = "";
     pendingScanUpload = false;
@@ -1438,18 +1834,59 @@ String securityName(wifi_auth_mode_t authMode) {
   switch (authMode) {
     case WIFI_AUTH_OPEN: return "Open";
     case WIFI_AUTH_WEP: return "WEP";
-    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA_PSK:
+    case WIFI_AUTH_WPA_ENTERPRISE: return "WPA";
     case WIFI_AUTH_WPA2_PSK:
     case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2";
     case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
-    case WIFI_AUTH_WPA3_PSK: return "WPA3";
-    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
-    default: return "Unknown";
+    case WIFI_AUTH_WPA3_PSK:
+    case WIFI_AUTH_WPA3_EXT_PSK:
+    case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE:
+    case WIFI_AUTH_WPA3_ENTERPRISE:
+    case WIFI_AUTH_WPA3_ENT_192: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE: return "WPA2/WPA3";
+    case WIFI_AUTH_OWE: return "OWE";  // Wi-Fi Enhanced Open: encrypted, not authenticated
+    default: return "Unknown";       // WAPI, DPP and future modes
   }
 }
 
+size_t configuredWifiNetworkCount() {
+  size_t count = 0;
+  for (size_t index = 0; index < WIFI_NETWORK_SLOTS; index++) {
+    if (WIFI_NETWORKS[index].ssid[0] != '\0') count++;
+  }
+  return count;
+}
+
+// With more than one network configured, scan once and pick the first configured
+// network that is in range (config order = preference). Falls back to the first one.
+size_t chooseWifiNetwork() {
+  size_t fallback = 0;
+  while (fallback < WIFI_NETWORK_SLOTS && WIFI_NETWORKS[fallback].ssid[0] == '\0') fallback++;
+  if (configuredWifiNetworkCount() < 2) return fallback;
+  WiFi.disconnect();
+  const int found = WiFi.scanNetworks();
+  size_t chosen = fallback;
+  bool inRange = false;
+  for (size_t index = 0; index < WIFI_NETWORK_SLOTS && !inRange; index++) {
+    if (WIFI_NETWORKS[index].ssid[0] == '\0') continue;
+    for (int network = 0; network < found; network++) {
+      if (WiFi.SSID(network) == WIFI_NETWORKS[index].ssid) {
+        chosen = index;
+        inRange = true;
+        break;
+      }
+    }
+  }
+  WiFi.scanDelete();
+  diagnosticLog("INFO", 0, "WIFI_SELECT", "scan found %d networks; using \"%s\" (%s)", found,
+                WIFI_NETWORKS[chosen].ssid, inRange ? "in range" : "none in range, trying first");
+  return chosen;
+}
+
 void connectToNetwork() {
-  if (!WIFI_SSID || WIFI_SSID[0] == '\0') {
+  if (configuredWifiNetworkCount() == 0) {
     wifiConnectPending = false;
     diagnosticError(0, "WIFI_CONFIG",
                     "configured SSID is empty; WiFi.begin was not called",
@@ -1457,12 +1894,14 @@ void connectToNetwork() {
                     "set WIFISHIELD_WIFI_SSID in the local wifi_shield_config.h; do not share its password");
     return;
   }
+  selectedWifiNetwork = chooseWifiNetwork();
   wifiConnectPending = true;
   lastWifiAttempt = millis();
   diagnosticLog("INFO", 0, "WIFI_CONNECT",
                 "initial connection attempt; SSID configured=yes; password omitted; %s",
                 wifiDiagnostics().c_str());
-  const wl_status_t beginStatus = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  const wl_status_t beginStatus = WiFi.begin(WIFI_NETWORKS[selectedWifiNetwork].ssid,
+                                             WIFI_NETWORKS[selectedWifiNetwork].password);
   diagnosticLog("INFO", 0, "WIFI_CONNECT",
                 "WiFi.begin returned=%d (%s); auto-reconnect=%s; %s",
                 static_cast<int>(beginStatus), wifiStatusName(beginStatus),
@@ -1568,7 +2007,51 @@ void pollScan() {
   WiFi.scanDelete();
 }
 
-void mapTouchPoint(const TS_Point &point, int &screenX, int &screenY) {
+int16_t bestTwoAverage(int16_t a, int16_t b, int16_t c) {
+  const int16_t ab = abs(a - b);
+  const int16_t ac = abs(a - c);
+  const int16_t bc = abs(b - c);
+  if (ab <= ac && ab <= bc) return (a + b) >> 1;
+  if (ac <= ab && ac <= bc) return (a + c) >> 1;
+  return (b + c) >> 1;
+}
+
+int16_t sampleSpread(int16_t a, int16_t b, int16_t c) {
+  return max(a, max(b, c)) - min(a, min(b, c));
+}
+
+// Reads the XPT2046 directly: the XPT2046_Touchscreen library hard-codes a
+// pressure threshold of 400, which is too stiff for this panel. Same command
+// sequence and SPI settings as that library (rotation 1 orientation).
+bool readTouch(TouchSample &sample) {
+  int16_t data[6];
+  touchSpi.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(TOUCH_CS_PIN, LOW);
+  touchSpi.transfer(0xB1);
+  const int16_t z1 = touchSpi.transfer16(0xC1) >> 3;
+  const int16_t z2 = touchSpi.transfer16(0x91) >> 3;
+  touchSpi.transfer16(0x91);  // first position reading is noisy
+  data[0] = touchSpi.transfer16(0xD1) >> 3;
+  data[1] = touchSpi.transfer16(0x91) >> 3;
+  data[2] = touchSpi.transfer16(0xD1) >> 3;
+  data[3] = touchSpi.transfer16(0x91) >> 3;
+  data[4] = touchSpi.transfer16(0xD0) >> 3;  // last reading, then power down
+  data[5] = touchSpi.transfer16(0) >> 3;
+  digitalWrite(TOUCH_CS_PIN, HIGH);
+  touchSpi.endTransaction();
+
+  sample.z = max(0, z1 + 4095 - z2);
+  if (sample.z < TOUCH_Z_MIN) return false;
+  if (sampleSpread(data[0], data[2], data[4]) > TOUCH_MAX_SPREAD ||
+      sampleSpread(data[1], data[3], data[5]) > TOUCH_MAX_SPREAD) {
+    return false;
+  }
+  sample.x = bestTwoAverage(data[0], data[2], data[4]);
+  sample.y = bestTwoAverage(data[1], data[3], data[5]);
+  return true;
+}
+
+void mapTouchPoint(const TouchSample &point, int &screenX, int &screenY) {
   int rawX = point.x;
   int rawY = point.y;
   if (TOUCH_SWAP_AXES) {
@@ -1585,6 +2068,8 @@ void mapTouchPoint(const TS_Point &point, int &screenX, int &screenY) {
 }
 
 void changePage(int direction) {
+  const size_t previousNetworkPage = networkPage;
+  const size_t previousAlertPage = alertPage;
   if (currentScreen == SCREEN_NETWORKS) {
     const size_t pages = max(static_cast<size_t>(1),
         (networkCount + NETWORKS_PER_PAGE - 1) / NETWORKS_PER_PAGE);
@@ -1595,6 +2080,8 @@ void changePage(int direction) {
     if (direction < 0 && alertPage > 0) alertPage--;
     else if (direction > 0 && alertPage + 1 < pages) alertPage++;
   }
+  // Nothing to page to (e.g. no networks yet): skip the redraw so the screen does not flicker.
+  if (networkPage == previousNetworkPage && alertPage == previousAlertPage) return;
   renderCurrentScreen();
 }
 
@@ -1637,7 +2124,8 @@ void handleTouch(int x, int y) {
 }
 
 void pollTouch() {
-  if (!touch.touched()) {
+  TouchSample point;
+  if (!readTouch(point)) {
     touchWasDown = false;
     return;
   }
@@ -1645,16 +2133,7 @@ void pollTouch() {
   touchWasDown = true;
   lastTouchMillis = millis();
 
-  const TS_Point point = touch.getPoint();
-  const bool coordinatesInRange =
-      point.x >= TOUCH_RAW_X_MIN && point.x <= TOUCH_RAW_X_MAX &&
-      point.y >= TOUCH_RAW_Y_MIN && point.y <= TOUCH_RAW_Y_MAX;
-  if (point.z < 400 || !coordinatesInRange) {
-    Serial.printf("[TOUCH] rejected raw X=%d Y=%d Z=%d; check XPT2046 SPI/wiring and calibrate with measured panel corners\n",
-                  point.x, point.y, point.z);
-    return;
-  }
-
+  // Edge touches can read slightly outside the calibration range; mapTouchPoint clamps them.
   int x = 0;
   int y = 0;
   mapTouchPoint(point, x, y);
@@ -1663,33 +2142,44 @@ void pollTouch() {
   handleTouch(x, y);
 }
 
+// Weakest GPIO drive on the parallel bus: softer edges stop ringing/crosstalk on the
+// jumper wiring. Measured: default drive corrupted ~5% of drawn blocks, weakest drive 0%.
+void setDisplayBusDrive() {
+  for (const int pin : {TFT_D0, TFT_D1, TFT_D2, TFT_D3, TFT_D4, TFT_D5, TFT_D6, TFT_D7,
+                        TFT_WR, TFT_DC, TFT_RD, TFT_RST}) {
+    gpio_set_drive_capability(static_cast<gpio_num_t>(pin), GPIO_DRIVE_CAP_0);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  pinMode(TFT_CS, OUTPUT);
-  digitalWrite(TFT_CS, HIGH);
+  if (ALERT_LED_PIN >= 0) {
+    pinMode(ALERT_LED_PIN, OUTPUT);
+    digitalWrite(ALERT_LED_PIN, LOW);
+  }
   pinMode(TOUCH_CS_PIN, OUTPUT);
   digitalWrite(TOUCH_CS_PIN, HIGH);
-  pinMode(TFT_RST, OUTPUT);
-  digitalWrite(TFT_RST, HIGH);
-  delay(10);
-  digitalWrite(TFT_RST, LOW);
-  delay(20);
-  digitalWrite(TFT_RST, HIGH);
-  delay(120);
 
-  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
-  tft.init();
+  // Set before tft.init() so the panel's power/VCOM/gamma init sequence is also sent
+  // cleanly, and again afterwards in case init's pinMode() calls reset it.
+  setDisplayBusDrive();
+  tft.init();  // performs the hardware reset on TFT_RST
+  setDisplayBusDrive();
   tft.setRotation(DISPLAY_ROTATION);
-  tft.fillScreen(color(2, 6, 23));
   drawStartupDiagnostic();
-  Serial.printf("[TFT] initialized with ILI9341; size=%d x %d rotation=%u CS=%d DC=%d RESET=%d SCK=%d MOSI=%d MISO=%d\n",
-                tft.width(), tft.height(), DISPLAY_ROTATION,
-                TFT_CS, TFT_DC, TFT_RST, SPI_SCK_PIN, SPI_MOSI_PIN, SPI_MISO_PIN);
+  Serial.printf("[TFT] initialized ILI9341 8-bit parallel; size=%d x %d rotation=%u WR=%d DC=%d RST=%d RD=%d\n",
+                tft.width(), tft.height(), DISPLAY_ROTATION, TFT_WR, TFT_DC, TFT_RST, TFT_RD);
 
-  touch.begin(SPI);
-  touch.setRotation(DISPLAY_ROTATION);
-  Serial.printf("[TOUCH] XPT2046 initialized on shared SPI; CS=%d; using polling because IRQ is optional\n",
-                TOUCH_CS_PIN);
+  analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+  updateBattery(true);
+  Serial.printf("[BATTERY] GPIO%d divider x%.1f -> %.2f V, %d%% (-1 = no cell)\n",
+                BATTERY_ADC_PIN, BATTERY_DIVIDER_RATIO, batteryVolts, batteryPercent);
+
+  touchSpi.begin(TOUCH_SCK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
+  Serial.printf("[TOUCH] XPT2046 on HSPI; CS=%d SCK=%d MISO=%d MOSI=%d; Z min=%d; polling\n",
+                TOUCH_CS_PIN, TOUCH_SCK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_Z_MIN);
+
+  apiBaseUrl = baseUrlFrom(API_URL[0] != '\0' ? API_URL : SNAPSHOT_URL);
 
   dataMutex = xSemaphoreCreateMutex();
   if (!dataMutex) {
@@ -1700,6 +2190,9 @@ void setup() {
   }
   WiFi.onEvent(onWiFiEvent);
   const bool stationStarted = WiFi.mode(WIFI_STA);
+  // Keep the radio awake: in the default modem-sleep mode the ESP32 can miss the PC's
+  // broadcast ARP requests, so the PC cannot answer it and uploads/discovery fail for minutes.
+  WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
   diagnosticLog(stationStarted ? "INFO" : "ERROR", 0, "WIFI_INIT",
                 "station mode %s; mode=%d status=%d (%s)",
@@ -1719,6 +2212,7 @@ void loop() {
   }
   pollTouch();
   pollScan();
+  updateBattery();
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnectPending = false;
@@ -1730,6 +2224,21 @@ void loop() {
                            " (" + wifiStatusName(WiFi.status()) + ")").c_str(),
                     "Wi-Fi did not connect within the initial wait",
                     "verify the local SSID/password configuration and router availability");
+  }
+
+  // With two networks configured, re-pick after 30 s without Wi-Fi (e.g. moved to the
+  // other network's location) instead of retrying a network that is out of range.
+  if (WiFi.status() != WL_CONNECTED && configuredWifiNetworkCount() > 1 &&
+      now - lastWifiAttempt >= WIFI_RESELECT_MS &&
+      (!wifiReconnectPending || now - wifiReconnectStartedAt >= WIFI_RESELECT_MS) &&
+      !scanInProgress && !apiTaskHandle) {
+    connectToNetwork();
+  }
+
+  if (backendDiscoveryNeeded && WiFi.status() == WL_CONNECTED && !scanInProgress &&
+      !apiTaskHandle && now - lastDiscoveryAttempt >= DISCOVERY_RETRY_MS) {
+    lastDiscoveryAttempt = now;
+    discoverBackend();
   }
 
   const bool retryReady = scanRetryPending &&
@@ -1744,8 +2253,12 @@ void loop() {
     activeScanCycleId = ++nextScanCycleId;
     activeScanCycleStartedAt = now;
     diagnosticLog("INFO", activeScanCycleId, "SCAN_CYCLE",
-                  "start; interval=%lu ms; Wi-Fi ready",
-                  static_cast<unsigned long>(SCAN_INTERVAL_MS));
+                  "start; interval=%lu ms; Wi-Fi ready; free-heap=%u largest-block=%u min-free=%u",
+                  static_cast<unsigned long>(SCAN_INTERVAL_MS),
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(ESP.getMinFreeHeap()));
+    restartIfMemoryExhausted("scan cycle start");
     beginScan(activeScanCycleId);
   }
 
@@ -1761,7 +2274,7 @@ void loop() {
 
   if (snapshotChanged && !startupDiagnosticVisible) {
     snapshotChanged = false;
-    renderCurrentScreen();
+    refreshCurrentScreenIfChanged();
   }
   delay(10);
 }

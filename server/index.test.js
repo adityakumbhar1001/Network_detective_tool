@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -236,5 +237,168 @@ test("persists trusted settings and detector alerts across server restarts", asy
       await new Promise((resolve, reject) => persistentServer.close((error) => error ? reject(error) : resolve()));
     }
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reports only detector alerts still present in the latest scan", async () => {
+  const latestServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => latestServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${latestServer.address().port}`;
+
+  try {
+    await fetch(`${url}/api/trusted-network`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssid: "LatestWiFi", bssid: trustedBssid, expectedSecurity: "WPA2" }),
+    });
+    const postScan = (security) => fetch(`${url}/api/scans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        networks: [{ ssid: "LatestWiFi", bssid: trustedBssid, rssi: -48, channel: 6, security }],
+      }),
+    });
+
+    await postScan("Open");
+    const downgraded = await (await fetch(`${url}/api/alerts`)).json();
+    assert.ok(downgraded.alerts.some((alert) => alert.type === "SECURITY_DOWNGRADE"));
+
+    await postScan("WPA2");
+    const alerts = await (await fetch(`${url}/api/alerts`)).json();
+    const display = await (await fetch(`${url}/api/snapshot?display=1`)).json();
+    const snapshot = await (await fetch(`${url}/api/snapshot`)).json();
+    assert.ok(!alerts.alerts.some((alert) => alert.type === "SECURITY_DOWNGRADE"));
+    assert.ok(!display.securityAlerts.some((alert) => alert.type === "SECURITY_DOWNGRADE"));
+    assert.ok(!snapshot.securityAlerts.some((alert) => alert.type === "SECURITY_DOWNGRADE"));
+  } finally {
+    await new Promise((resolve, reject) => latestServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("classifies WPA/WPA2 mixed mode by its reported cipher", async () => {
+  const cipherServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => cipherServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${cipherServer.address().port}`;
+
+  try {
+    await fetch(`${url}/api/scans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        networks: [
+          { ssid: "AesOnly", bssid: "10:00:00:00:00:01", rssi: -50, channel: 1, security: "WPA/WPA2", pairwiseCipher: "CCMP", groupCipher: "CCMP" },
+          { ssid: "AllowsTkip", bssid: "20:00:00:00:00:02", rssi: -50, channel: 6, security: "WPA/WPA2", pairwiseCipher: "TKIP/CCMP", groupCipher: "TKIP" },
+          { ssid: "NoCipherData", bssid: "30:00:00:00:00:03", rssi: -50, channel: 11, security: "WPA/WPA2" },
+          { ssid: "Wpa2Tkip", bssid: "40:00:00:00:00:04", rssi: -50, channel: 11, security: "WPA2", pairwiseCipher: "TKIP", groupCipher: "TKIP" },
+        ],
+      }),
+    });
+    const snapshot = await (await fetch(`${url}/api/snapshot`)).json();
+    const status = Object.fromEntries(snapshot.networks.map((network) => [network.ssid, network.securityStatus]));
+    assert.deepEqual(status, { AesOnly: "encrypted", AllowsTkip: "weak", NoCipherData: "weak", Wpa2Tkip: "weak" });
+
+    const warnings = Object.fromEntries(snapshot.alerts.map((alert) => [alert.ssid, alert]));
+    assert.equal(warnings.AesOnly, undefined);
+    assert.match(warnings.AllowsTkip.message, /TKIP/);
+    assert.equal(warnings.AllowsTkip.severity, "High");
+    assert.equal(warnings.NoCipherData.severity, "Medium");
+  } finally {
+    await new Promise((resolve, reject) => cipherServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("keeps recently heard networks for a short window, strongest first", async () => {
+  const recentServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => recentServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${recentServer.address().port}`;
+  const postScan = (networks) => fetch(`${url}/api/scans`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ deviceId: "esp32-recent", networks }),
+  });
+
+  try {
+    await postScan([
+      { ssid: "Near", bssid: "50:00:00:00:00:01", rssi: -40, channel: 1, security: "WPA2" },
+      { ssid: "EdgeOfRange", bssid: "60:00:00:00:00:02", rssi: -92, channel: 6, security: "WPA2" },
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 5));  // distinct receive timestamps
+    await postScan([
+      { ssid: "Near", bssid: "50:00:00:00:00:01", rssi: -41, channel: 1, security: "WPA2" },
+      { ssid: "Middle", bssid: "70:00:00:00:00:03", rssi: -70, channel: 11, security: "WPA2" },
+    ]);
+    const snapshot = await (await fetch(`${url}/api/snapshot`)).json();
+    assert.deepEqual(snapshot.networks.map((network) => network.ssid), ["Near", "Middle", "EdgeOfRange"]);
+    const edge = snapshot.networks.find((network) => network.ssid === "EdgeOfRange");
+    assert.equal(edge.seenInLatestScan, false);
+    assert.equal(snapshot.networks.find((network) => network.ssid === "Near").seenInLatestScan, true);
+  } finally {
+    await new Promise((resolve, reject) => recentServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("labels open campus networks as sign-in portals and groups their access points", async () => {
+  const campusServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => campusServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${campusServer.address().port}`;
+
+  try {
+    await fetch(`${url}/api/scans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        networks: [
+          { ssid: "vit_student", bssid: "10:00:00:00:00:01", rssi: -50, channel: 1, security: "Open" },
+          { ssid: "VIT_Student", bssid: "20:00:00:00:00:02", rssi: -60, channel: 6, security: "Open" },
+          { ssid: "VIT_STUDENT", bssid: "30:00:00:00:00:03", rssi: -70, channel: 11, security: "Open" },
+          { ssid: "CafeOpen", bssid: "40:00:00:00:00:04", rssi: -65, channel: 11, security: "Open" },
+        ],
+      }),
+    });
+    const full = await (await fetch(`${url}/api/snapshot`)).json();
+    const byBssid = Object.fromEntries(full.networks.map((network) => [network.bssid, network.securityStatus]));
+    assert.equal(byBssid["10:00:00:00:00:01"], "portal");
+    assert.equal(byBssid["40:00:00:00:00:04"], "insecure");
+    assert.ok(full.alerts.some((alert) => alert.type === "PORTAL_NETWORK" && alert.severity === "Low"));
+    assert.ok(full.alerts.some((alert) => alert.type === "OPEN_NETWORK" && alert.ssid === "CafeOpen"));
+    assert.equal(full.securityAlerts.filter((alert) => alert.type === "DUPLICATE_SSID_WARNING").length, 0);
+
+    const display = await (await fetch(`${url}/api/snapshot?display=1`)).json();
+    assert.equal(display.networks.length, 2);
+    assert.equal(display.networks[0].apCount, 1 + 2);
+    assert.equal(display.networks[0].securityStatus, "portal");
+  } finally {
+    await new Promise((resolve, reject) => campusServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("flags a campus-named access point whose vendor prefix differs from the others", async () => {
+  const vendorServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => vendorServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${vendorServer.address().port}`;
+
+  try {
+    await fetch(`${url}/api/scans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        networks: [
+          { ssid: "VIT_Student", bssid: "AA:11:22:00:00:01", rssi: -50, channel: 1, security: "Open" },
+          { ssid: "VIT_Student", bssid: "AA:11:22:00:00:02", rssi: -55, channel: 6, security: "Open" },
+          { ssid: "VIT_Student", bssid: "A8:11:22:00:00:03", rssi: -60, channel: 11, security: "Open" },
+          { ssid: "VIT_Student", bssid: "DE:AD:BE:EF:00:09", rssi: -45, channel: 6, security: "Open" },
+        ],
+      }),
+    });
+    const snapshot = await (await fetch(`${url}/api/snapshot`)).json();
+    const flagged = snapshot.securityAlerts.filter((alert) => alert.type === "CAMPUS_VENDOR_MISMATCH");
+    assert.equal(flagged.length, 1);
+    assert.equal(flagged[0].observedBssid, "DE:AD:BE:EF:00:09");
+    const rogue = snapshot.networks.find((network) => network.bssid === "DE:AD:BE:EF:00:09");
+    assert.equal(rogue.suspicious, true);
+    const display = await (await fetch(`${url}/api/snapshot?display=1`)).json();
+    assert.equal(display.networks.length, 2);  // one grouped card (x3) + the flagged AP
+  } finally {
+    await new Promise((resolve, reject) => vendorServer.close((error) => error ? reject(error) : resolve()));
   }
 });

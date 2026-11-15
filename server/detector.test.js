@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { processScanDetections, securityStrength } from "./detector.js";
+import { processScanDetections, sameRouterBssids, securityStrength } from "./detector.js";
 
 const trustedBssid = "AA:BB:CC:11:22:33";
 const otherBssid = "11:22:33:44:55:66";
@@ -174,4 +174,39 @@ test("repeated unchanged duplicate observations update one alert", () => {
   assert.equal(state.alerts.length, 1);
   assert.equal(state.alerts[0].id, firstId);
   assert.equal(state.alerts[0].updatedAt, scan(networks, 2).scannedAt);
+});
+
+test("recognises BSSIDs from the same router's address block", () => {
+  assert.ok(sameRouterBssids("24:0B:88:FB:9E:69", "26:0B:88:CB:9E:69"));
+  assert.ok(sameRouterBssids("AA:BB:CC:11:22:33", "AA:BB:CC:11:22:34"));
+  assert.ok(!sameRouterBssids("AA:BB:CC:11:22:33", "AA:BB:CC:99:22:34"));
+  assert.ok(!sameRouterBssids("AA:BB:CC:11:22:33", "AA:BB:CD:11:22:33"));
+});
+
+test("does not warn about duplicate SSIDs from one router's radios", () => {
+  const state = makeState();
+  processScanDetections(state, scan([
+    network("24:0B:88:FB:9E:69", { ssid: "RouterWiFi" }),
+    network("26:0B:88:CB:9E:69", { ssid: "RouterWiFi", channel: 11 }),
+  ], 1));
+
+  assert.equal(state.alerts.length, 0);
+});
+
+test("keeps reporting a same-router BSSID on the trusted SSID at lower risk", () => {
+  const state = makeState(trustedBaseline());
+  processScanDetections(state, scan([
+    network(trustedBssid),
+    network("AA:BB:CC:11:22:34"),
+  ], 1));
+
+  const duplicate = state.alerts.find((alert) => alert.type === "SUSPICIOUS_DUPLICATE_AP");
+  assert.ok(duplicate);
+  assert.equal(duplicate.evidence.sameRouterAddressRange, true);
+  assert.equal(duplicate.severity, "Low");
+});
+
+test("ranks Enhanced Open (OWE) above open networks and below WPA2", () => {
+  assert.ok(securityStrength("OWE") > securityStrength("Open"));
+  assert.ok(securityStrength("OWE") < securityStrength("WPA2"));
 });

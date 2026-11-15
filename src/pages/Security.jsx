@@ -15,6 +15,8 @@ import { useWifiData } from "../useWifiData";
 import { setTrustedNetwork, updateAlertStatus } from "../services/api";
 
 const SECURITY_MODES = ["Open", "WEP", "WPA", "WPA/WPA2", "WPA2", "WPA3", "WPA2/WPA3", "Unknown"];
+// Same ranking as the backend detector (server/detector.js).
+const SECURITY_STRENGTH = { Open: 0, WEP: 1, WPA: 2, "WPA/WPA2": 2, OWE: 2, WPA2: 3, "WPA2/WPA3": 3, WPA3: 4 };
 
 function formatTimestamp(timestamp) {
   if (!timestamp) return "Time unavailable";
@@ -169,6 +171,13 @@ function Security() {
             >
               {SECURITY_MODES.map((security) => <option key={security}>{security}</option>)}
             </select>
+            {selectedNetwork && (SECURITY_STRENGTH[expectedSecurity] ?? -1) > (SECURITY_STRENGTH[selectedNetwork.security] ?? 99) && (
+              <p className="security-error" role="note">
+                Expected {expectedSecurity} is stronger than the {selectedNetwork.security} this network
+                broadcasts now, so a security-downgrade alert will be raised immediately. Choose
+                the mode it really uses unless you want to demonstrate that alert.
+              </p>
+            )}
             <button className="security-primary-button" type="submit" disabled={!selectedNetwork || saving}>
               <Save size={16} />{saving ? "Saving..." : "Save as trusted"}
             </button>
