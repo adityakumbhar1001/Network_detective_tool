@@ -92,7 +92,10 @@ test("accepts ESP32 scans and exposes classified live data", async () => {
   assert.equal(Number(displayResponse.headers.get("content-length")), Buffer.byteLength(displayText));
   const displaySnapshot = JSON.parse(displayText);
   assert.deepEqual(Object.keys(displaySnapshot).sort(), [
+    "bestChannel",
     "deviceId",
+    "healthLabel",
+    "healthScore",
     "networks",
     "receivedAt",
     "scannedAt",
@@ -400,5 +403,41 @@ test("flags a campus-named access point whose vendor prefix differs from the oth
     assert.equal(display.networks.length, 2);  // one grouped card (x3) + the flagged AP
   } finally {
     await new Promise((resolve, reject) => vendorServer.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("reports a health score, a least-crowded channel and a WPA3 transition note", async () => {
+  const healthServer = createWifiServer({ persistencePath: null });
+  await new Promise((resolve) => healthServer.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${healthServer.address().port}`;
+  const postScan = (networks) => fetch(`${url}/api/scans`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ networks }),
+  });
+
+  try {
+    await postScan([
+      { ssid: "Crowded1", bssid: "10:00:00:00:00:01", rssi: -45, channel: 1, security: "WPA2", pairwiseCipher: "CCMP", groupCipher: "CCMP" },
+      { ssid: "Crowded2", bssid: "20:00:00:00:00:02", rssi: -50, channel: 2, security: "WPA2", pairwiseCipher: "CCMP", groupCipher: "CCMP" },
+      { ssid: "Six", bssid: "30:00:00:00:00:03", rssi: -60, channel: 6, security: "WPA2/WPA3" },
+    ]);
+    const clean = await (await fetch(`${url}/api/snapshot`)).json();
+    assert.equal(clean.channelAdvice.recommended, 11);
+    assert.equal(clean.health.score, 100);
+    assert.equal(clean.health.label, "Good");
+    assert.ok(clean.alerts.some((alert) => alert.type === "WPA3_TRANSITION_MODE" && alert.severity === "Low"));
+
+    await postScan([
+      { ssid: "Cafe", bssid: "40:00:00:00:00:04", rssi: -50, channel: 11, security: "Open" },
+      { ssid: "Old", bssid: "50:00:00:00:00:05", rssi: -55, channel: 6, security: "WEP" },
+    ]);
+    const risky = await (await fetch(`${url}/api/snapshot`)).json();
+    assert.ok(risky.health.score < 100);
+    const display = await (await fetch(`${url}/api/snapshot?display=1`)).json();
+    assert.equal(display.healthScore, risky.health.score);
+    assert.equal(display.bestChannel, risky.channelAdvice.recommended);
+  } finally {
+    await new Promise((resolve, reject) => healthServer.close((error) => error ? reject(error) : resolve()));
   }
 });

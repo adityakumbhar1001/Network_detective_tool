@@ -160,6 +160,9 @@ size_t networkCount = 0;
 size_t securityAlertCount = 0;
 size_t activeAlertCount = 0;
 size_t highPriorityAlertCount = 0;
+int healthScore = -1;     // 0-100 from the backend, -1 = unknown
+String healthLabel;
+int bestChannel = 0;      // least crowded of 1/6/11, 0 = unknown
 size_t criticalAlertCount = 0;
 size_t highAlertCount = 0;
 size_t mediumAlertCount = 0;
@@ -1085,6 +1088,16 @@ void drawSecurityScreen() {
   tft.drawString("Weak  " + String(weak) + "   Open  " + String(open) + "   Portal  " + String(portal), 14, 95);
   tft.setTextColor(color(148, 163, 184), TFT_BLACK);
   tft.drawString("Unknown  " + String(unknown) + "     Networks  " + String(networkCount), 14, 115);
+  if (healthScore >= 0) {
+    const uint16_t healthColor = healthScore >= 80 ? color(74, 222, 128)
+                               : healthScore >= 60 ? color(251, 191, 36) : color(248, 113, 113);
+    tft.setTextColor(healthColor, TFT_BLACK);
+    tft.drawRightString("Health " + String(healthScore) + " " + healthLabel, width - 8, 50, 1);
+  }
+  if (bestChannel > 0) {
+    tft.setTextColor(color(125, 211, 252), TFT_BLACK);
+    tft.drawString("Least crowded channel: " + String(bestChannel), 14, 127);
+  }
   tft.setTextFont(2);
   tft.setTextColor(color(203, 213, 225), TFT_BLACK);
   tft.drawString("Active backend findings", 10, 143);
@@ -1204,6 +1217,8 @@ uint32_t displaySignature(bool includeContent) {
       }
       break;
     case SCREEN_SECURITY:
+      hash = hashMix(hash, static_cast<uint32_t>(healthScore));
+      hash = hashMix(hash, static_cast<uint32_t>(bestChannel));
       hash = hashMix(hash, networkCount);
       for (size_t index = 0; index < networkCount; index++) {
         hash = hashMix(hash, networks[index].securityStatus);
@@ -1436,6 +1451,9 @@ bool populateSnapshot(DynamicJsonDocument &snapshot, uint32_t cycleId,
   }
 
   scannedAt = jsonText(snapshot["scannedAt"]);
+  healthScore = snapshot["healthScore"] | -1;
+  healthLabel = jsonText(snapshot["healthLabel"]);
+  bestChannel = snapshot["bestChannel"] | 0;
   const String status = jsonText(snapshot["status"], "waiting");
   snapshotStatus = status == "stale" ? "STALE" :
       status == "live" ? "LIVE" : "WAITING";

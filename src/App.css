@@ -234,7 +234,7 @@ body {
 .stats-grid {
   display: grid;
 
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 
   gap: 20px;
 
@@ -1540,4 +1540,10 @@ body {
 
 .status-dot.live {
   background: #22c55e;
+}
+
+.stat-card h2 small {
+  font-size: 13px;
+  font-weight: 600;
+  color: #64748b;
 }

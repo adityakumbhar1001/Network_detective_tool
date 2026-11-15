@@ -315,6 +315,15 @@ function makeSnapshot(state) {
         anomalyScore: 90,
         severity: "High",
       });
+    } else if (network.security === "WPA2/WPA3") {
+      alerts.push({
+        type: "WPA3_TRANSITION_MODE",
+        message: "WPA2/WPA3 transition mode: a client can be pushed down to WPA2, so WPA3's extra protection is not guaranteed.",
+        ssid: network.ssid,
+        bssid: network.bssid,
+        anomalyScore: 15,
+        severity: "Low",
+      });
     } else if (network.securityStatus === "portal") {
       alerts.push({
         type: "PORTAL_NETWORK",
@@ -373,6 +382,8 @@ function makeSnapshot(state) {
     networks,
     alerts,
     securityAlerts: latestAlerts(state),
+    health: computeHealth(networks, latestAlerts(state)),
+    channelAdvice: computeChannelAdvice(networks),
     trustedNetwork: state.trustedNetwork,
     trustedAP,
     channels: [...channelCounts.entries()]
@@ -381,6 +392,44 @@ function makeSnapshot(state) {
     heatmap: networks.length ? [networks.map((network) => network.rssi)] : [],
     history: state.history,
   };
+}
+
+// 0-100 summary of the surroundings from networks heard in the latest scan and the active
+// detector findings. Heuristic: it ranks environments, it does not measure risk precisely.
+function computeHealth(networks, securityAlerts) {
+  const current = networks.filter((network) => network.seenInLatestScan !== false);
+  if (!current.length) return { score: null, label: "No data" };
+  const count = (status) => current.filter((network) => network.securityStatus === status).length;
+  const severityWeight = { Critical: 20, High: 12, Medium: 5, Low: 1 };
+  const findingPenalty = Math.min(
+    45,
+    securityAlerts
+      .filter((alert) => alert.status !== "Resolved")
+      .reduce((total, alert) => total + (severityWeight[alert.severity] ?? 0), 0),
+  );
+  const penalty = Math.min(36, count("insecure") * 6) + Math.min(18, count("weak") * 3) +
+    Math.min(5, count("portal")) + findingPenalty;
+  const score = Math.max(0, 100 - penalty);
+  return { score, label: score >= 80 ? "Good" : score >= 60 ? "Fair" : "Poor" };
+}
+
+// Least crowded of the non-overlapping 2.4 GHz channels (1, 6, 11). Channels closer than
+// 5 apart overlap; stronger signals count more.
+function computeChannelAdvice(networks) {
+  const current = networks.filter(
+    (network) => network.seenInLatestScan !== false && network.channel >= 1 && network.channel <= 14,
+  );
+  if (!current.length) return { recommended: null, congestion: [] };
+  const congestion = [1, 6, 11].map((channel) => {
+    const load = current.reduce((total, network) => {
+      const overlap = Math.max(0, 1 - Math.abs(network.channel - channel) / 5);
+      const strength = Math.min(1, Math.max(0.1, (network.rssi + 95) / 55));
+      return total + overlap * strength;
+    }, 0);
+    return { channel, load: Number(load.toFixed(1)) };
+  });
+  const recommended = [...congestion].sort((left, right) => left.load - right.load || left.channel - right.channel)[0].channel;
+  return { recommended, congestion };
 }
 
 // The small display lists one card per network name: access points sharing a name (and the
@@ -429,6 +478,9 @@ function makeDisplaySnapshot(state) {
     deviceId: snapshot.deviceId,
     scannedAt: snapshot.scannedAt,
     receivedAt: snapshot.receivedAt,
+    healthScore: snapshot.health.score ?? -1,
+    healthLabel: snapshot.health.label,
+    bestChannel: snapshot.channelAdvice.recommended ?? 0,
     networks: groupForDisplay(snapshot.networks).map((network) => ({
       ssid: network.ssid,
       bssid: network.bssid,

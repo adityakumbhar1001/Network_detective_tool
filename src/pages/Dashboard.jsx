@@ -8,7 +8,7 @@ import {
 import { useWifiData } from "../useWifiData";
 
 function Dashboard() {
-  const { networks, alerts, securityAlerts = [], trustedAP, modeLabel } = useWifiData();
+  const { networks, alerts, securityAlerts = [], trustedAP, modeLabel, health, channelAdvice } = useWifiData();
   const activeSecurityAlerts = securityAlerts.filter((alert) => alert.status !== "Resolved");
 
   // Highest risk across per-network security warnings and backend detector findings.
@@ -76,6 +76,26 @@ function Dashboard() {
           <div>
             <p>Highest Risk</p>
             <h2>{highestRisk}</h2>
+          </div>
+        </div>
+
+        <div className="stat-card" title="Heuristic 0-100 summary of the latest scan: open/weak networks and active findings lower it">
+          <div className="stat-icon">
+            <ShieldCheck size={24} />
+          </div>
+          <div>
+            <p>Network Health</p>
+            <h2>{health?.score ?? "--"}<small>{health?.score != null ? ` / 100 ${health.label}` : ""}</small></h2>
+          </div>
+        </div>
+
+        <div className="stat-card" title="Least crowded of the non-overlapping 2.4 GHz channels (1, 6, 11), by signal-weighted overlap">
+          <div className="stat-icon">
+            <Wifi size={24} />
+          </div>
+          <div>
+            <p>Best Channel (2.4 GHz)</p>
+            <h2>{channelAdvice?.recommended ?? "--"}</h2>
           </div>
         </div>
       </div>
