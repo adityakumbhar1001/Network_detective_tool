@@ -1528,3 +1528,16 @@ body {
   .security-alerts-panel .panel-header { align-items: flex-start; flex-wrap: wrap; }
   .security-alerts-panel .panel-header span { text-align: left; }
 }
+/* Networks kept from the last minute but not heard in the latest scan */
+.network-row.not-current,
+.network-table tr.not-current {
+  opacity: 0.55;
+}
+
+.security-panel .alert-box + .alert-box {
+  margin-top: 10px;
+}
+
+.status-dot.live {
+  background: #22c55e;
+}

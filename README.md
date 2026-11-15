@@ -2,6 +2,11 @@
 
 Wi-Fi scan dashboard backed by an ESP32 and a local API. See [ESP32_SETUP.md](ESP32_SETUP.md) for startup and device connection steps.
 
+- [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) – architecture, detection rules, limits, Q&A
+- [CHANGES_AND_IMPROVEMENTS.md](CHANGES_AND_IMPROVEMENTS.md) – what changed and how accuracy improved
+- [DEMO_GUIDE.md](DEMO_GUIDE.md) – step-by-step demo and troubleshooting
+- [esp32/HARDWARE_AND_LIBRARIES.md](esp32/HARDWARE_AND_LIBRARIES.md) – wiring, libraries, diagnostic sketches
+
 ## Run Locally
 
 Prerequisite: Node.js 20.19+ or 22.12+.
@@ -23,7 +28,7 @@ npm run build
 
 ## ESP32 Configuration
 
-Copy `esp32/wifi_shield_esp32/wifi_shield_config.example.h` to `esp32/wifi_shield_esp32/wifi_shield_config.h`, then set the Wi-Fi SSID/password and API URL using the development computer's LAN IP. The local config file is ignored by Git. Do not use `localhost` in the ESP32 API URL.
+Copy `esp32/wifi_shield_esp32/wifi_shield_config.example.h` to `esp32/wifi_shield_esp32/wifi_shield_config.h`, then set the Wi-Fi SSID/password (optionally a second network). The ESP32 finds the backend by UDP discovery on port 3001, so the API URL is only a starting guess. The local config file is ignored by Git. Do not use `localhost` in the ESP32 API URL.
 
 The firmware scans every 15 seconds and sends the existing `deviceId`, optional `scannedAt`, and `networks` fields (`ssid`, `bssid`, `rssi`, `channel`, `security`). The payload format is unchanged.
 

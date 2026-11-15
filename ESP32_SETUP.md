@@ -22,9 +22,9 @@ Open the Vite URL shown by `npm run dev`. Until the first ESP32 scan arrives, th
 ## Configure The ESP32
 
 1. Copy `esp32/wifi_shield_esp32/wifi_shield_config.example.h` to `esp32/wifi_shield_esp32/wifi_shield_config.h`.
-2. Set `WIFISHIELD_WIFI_SSID` and `WIFISHIELD_WIFI_PASSWORD` in the local header. The ESP32 and development PC must be on a network that allows devices to communicate.
-3. Find the PC's IPv4 address on that network with `ipconfig`. Set `WIFISHIELD_API_URL` to `http://<PC-LAN-IP>:3001/api/scans`. Do not use `localhost`; from the ESP32 that points back to the ESP32 itself.
-4. Open `esp32/wifi_shield_esp32/wifi_shield_esp32.ino` in Arduino IDE. Install ArduinoJson, select an ESP32 board, start the API, allow inbound TCP port 3001 through the PC firewall if prompted, and upload the sketch.
+2. Set `WIFISHIELD_WIFI_SSID` and `WIFISHIELD_WIFI_PASSWORD` in the local header, and optionally a second network in `WIFISHIELD_WIFI_SSID_2` / `WIFISHIELD_WIFI_PASSWORD_2`. At start-up the ESP32 joins whichever configured network is in range (2.4 GHz only). The ESP32 and the backend PC must be on the same network.
+3. The backend's IP does not need to be configured: the firmware broadcasts a discovery request on UDP port 3001 and the backend answers, so the API address follows the PC to any network. `WIFISHIELD_API_URL` is only the starting guess. Do not use `localhost`; from the ESP32 that points back to the ESP32 itself.
+4. Open `esp32/wifi_shield_esp32/wifi_shield_esp32.ino` in Arduino IDE. Install ArduinoJson and TFT_eSPI (see `esp32/HARDWARE_AND_LIBRARIES.md` for the display setup and the one-line TFT_eSPI patch needed with ESP32 core 3.x), select **ESP32 Dev Module**, start the API, allow Node.js through the PC firewall (TCP and UDP 3001) if prompted, and upload the sketch.
 
 The local config header is excluded from Git. If it is missing, the sketch compiles with placeholder values and will not connect until configured.
 

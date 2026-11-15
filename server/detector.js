@@ -1,3 +1,4 @@
+import process from "node:process";
 import { randomUUID } from "node:crypto";
 
 const SECURITY_STRENGTH = {
@@ -5,11 +6,97 @@ const SECURITY_STRENGTH = {
   WEP: 1,
   WPA: 2,
   "WPA/WPA2": 2,
+  // Enhanced Open encrypts traffic but does not authenticate the AP: stronger than
+  // Open/WEP, weaker than WPA2 against an impersonating access point.
+  OWE: 2,
   WPA2: 3,
   "WPA2/WPA3": 3,
   WPA3: 4,
   Unknown: null,
 };
+
+// Campus networks: many access points share one SSID, and "open" ones put users behind a
+// browser sign-in page (captive portal), which a scan cannot see. Names are matched
+// case-insensitively. Add more with WIFISHIELD_CAMPUS_SSIDS="name1,name2".
+const CAMPUS_SSIDS = new Set(
+  ["VIT_Student", "VIT_Staff", "VIT_TPO",
+    ...(process.env.WIFISHIELD_CAMPUS_SSIDS ?? "").split(",")]
+    .map((name) => name.trim().toLowerCase())
+    .filter(Boolean),
+);
+
+export function isKnownCampusSsid(ssid) {
+  return CAMPUS_SSIDS.has(String(ssid ?? "").trim().toLowerCase());
+}
+
+// Vendor prefix = first three bytes of the BSSID, ignoring the locally-administered bit
+// (virtual SSIDs of one AP differ only there). WIFISHIELD_CAMPUS_OUIS="AA:BB:CC,..." lists
+// the prefixes the campus really uses; without it the prefixes shared by at least two
+// access points of the same campus SSID are taken as normal.
+export function vendorPrefix(bssid) {
+  const bytes = String(bssid ?? "").split(":").map((part) => Number.parseInt(part, 16));
+  if (bytes.length < 3 || bytes.slice(0, 3).some(Number.isNaN)) return null;
+  return [bytes[0] & ~0x02, bytes[1], bytes[2]]
+    .map((byte) => byte.toString(16).padStart(2, "0").toUpperCase())
+    .join(":");
+}
+
+const CAMPUS_OUIS = new Set(
+  (process.env.WIFISHIELD_CAMPUS_OUIS ?? "").split(",")
+    .map((prefix) => vendorPrefix(`${prefix.trim()}:00:00:00`))
+    .filter(Boolean),
+);
+
+function campusVendorFindings(networks, addFinding, findings) {
+  const groups = new Map();
+  for (const network of networks) {
+    if (!network.ssid || !isKnownCampusSsid(network.ssid)) continue;
+    const key = network.ssid.trim().toLowerCase();
+    groups.set(key, [...(groups.get(key) ?? []), network]);
+  }
+  for (const group of groups.values()) {
+    const counts = new Map();
+    for (const network of group) {
+      const prefix = vendorPrefix(network.bssid);
+      counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+    }
+    let allowed = CAMPUS_OUIS;
+    if (!allowed.size) {
+      // Needs at least three access points to tell the usual hardware from an outlier.
+      if (group.length < 3) continue;
+      allowed = new Set([...counts].filter(([, count]) => count >= 2).map(([prefix]) => prefix));
+      if (!allowed.size) continue;
+    }
+    const securityCounts = new Map();
+    for (const network of group) {
+      securityCounts.set(network.security, (securityCounts.get(network.security) ?? 0) + 1);
+    }
+    const usualSecurity = [...securityCounts].sort((left, right) => right[1] - left[1])[0][0];
+    for (const network of group) {
+      const prefix = vendorPrefix(network.bssid);
+      if (!prefix || allowed.has(prefix)) continue;
+      const securityDiffers = network.security !== usualSecurity;
+      const riskScore = boundedScore(60 + (securityDiffers ? 15 : 0));
+      addFinding(findings, {
+        type: "CAMPUS_VENDOR_MISMATCH",
+        ssid: network.ssid,
+        observedBssid: network.bssid,
+        trustedBssid: null,
+        severity: severityFor(riskScore),
+        riskScore,
+        explanation: `This access point advertises the campus network name but its hardware vendor prefix (${prefix}) differs from the other ${network.ssid} access points. It may be a personal hotspot or a rogue access point; a different model of campus AP is also possible.`,
+        evidence: {
+          observedSecurity: network.security,
+          expectedSecurity: usualSecurity,
+          securityDiffers,
+          vendorPrefix: prefix,
+          rssi: network.rssi,
+          channel: network.channel,
+        },
+      });
+    }
+  }
+}
 
 export function securityStrength(security) {
   return SECURITY_STRENGTH[security] ?? null;
@@ -28,6 +115,21 @@ function boundedScore(score) {
 
 function conditionKey(type, ssid, bssid) {
   return `${type}:${ssid}:${bssid}`;
+}
+
+// True when two BSSIDs very likely belong to the same physical router (extra radios or
+// virtual APs): same vendor prefix ignoring the locally-administered bit (0x02), and at
+// most one of the last three bytes different, e.g. 24:0B:88:FB:9E:69 / 26:0B:88:CB:9E:69.
+export function sameRouterBssids(left, right) {
+  const a = left.split(":").map((part) => Number.parseInt(part, 16));
+  const b = right.split(":").map((part) => Number.parseInt(part, 16));
+  if (a.length !== 6 || b.length !== 6) return false;
+  if ((a[0] & ~0x02) !== (b[0] & ~0x02) || a[1] !== b[1] || a[2] !== b[2]) return false;
+  let differingBytes = 0;
+  for (let index = 3; index < 6; index++) {
+    if (a[index] !== b[index]) differingBytes++;
+  }
+  return differingBytes <= 1;
 }
 
 function addFinding(findings, finding) {
@@ -122,19 +224,25 @@ function makeFindings(state, scan, thresholdDb) {
   for (const [ssid, group] of networksBySsid) {
     const isTrustedSsid = Boolean(trusted?.ssid && ssid === trusted.ssid);
     if (group.length < 2 && !isTrustedSsid) continue;
+    // Known campus SSIDs legitimately have many access points: no duplicate warning.
+    if (!isTrustedSsid && isKnownCampusSsid(ssid)) continue;
+    // Untrusted SSIDs: radios of the same router are one network, not a duplicate.
     const candidates = isTrustedSsid
       ? group.filter((network) => network.bssid !== trusted.bssid)
-      : group.slice(1);
+      : group.slice(1).filter((network) => !sameRouterBssids(network.bssid, group[0].bssid));
 
     for (const network of candidates) {
       duplicateBssids.add(network.bssid);
+      // Trusted SSID: still reported (a MAC can be imitated), but a BSSID from the trusted
+      // router's own address block is far more likely its second radio than an evil twin.
+      const sameRouter = isTrustedSsid && sameRouterBssids(network.bssid, trusted.bssid);
       const referenceSecurity = isTrustedSsid ? trusted.expectedSecurity : null;
       const securityDiffers = Boolean(referenceSecurity && network.security !== referenceSecurity);
       const signal = rssiChanges.get(network.bssid);
       const referenceRssi = isTrustedSsid ? trusted.baselineRssi : null;
       const signalDeviation = Number.isFinite(referenceRssi) ? network.rssi - referenceRssi : null;
       const riskScore = boundedScore(
-        (isTrustedSsid ? 45 : 30) +
+        (isTrustedSsid ? (sameRouter ? 20 : 45) : 30) +
         (securityDiffers ? 22 : 0) +
         (isTrustedSsid && trusted.baselineChannel !== network.channel ? 5 : 0) +
         (signalDeviation !== null && Math.abs(signalDeviation) >= thresholdDb ? 12 : 0) +
@@ -148,10 +256,13 @@ function makeFindings(state, scan, thresholdDb) {
         trustedBssid: isTrustedSsid ? trusted.bssid : null,
         severity: severityFor(riskScore),
         riskScore,
-        explanation: isTrustedSsid
-          ? "An untrusted access point is advertising the trusted SSID. This can also occur with mesh systems, repeaters, or dual-band routers."
-          : "Multiple access points advertise this SSID. This is a warning only; mesh systems, repeaters, and dual-band routers commonly do this.",
+        explanation: sameRouter
+          ? "Another BSSID from the trusted router's own address range advertises the trusted SSID; most likely its second radio or a virtual AP."
+          : isTrustedSsid
+            ? "An untrusted access point is advertising the trusted SSID. This can also occur with mesh systems, repeaters, or dual-band routers."
+            : "Multiple access points advertise this SSID. This is a warning only; mesh systems, repeaters, and dual-band routers commonly do this.",
         evidence: {
+          sameRouterAddressRange: sameRouter,
           observedSecurity: network.security,
           expectedSecurity: referenceSecurity,
           securityDiffers,
@@ -164,6 +275,8 @@ function makeFindings(state, scan, thresholdDb) {
       });
     }
   }
+
+  campusVendorFindings(networks, addFinding, findings);
 
   if (trusted?.ssid && trusted.expectedSecurity) {
     const expectedStrength = securityStrength(trusted.expectedSecurity);

@@ -11,8 +11,15 @@ function Dashboard() {
   const { networks, alerts, securityAlerts = [], trustedAP, modeLabel } = useWifiData();
   const activeSecurityAlerts = securityAlerts.filter((alert) => alert.status !== "Resolved");
 
-  const anomalyScore =
-    alerts.length > 0 ? alerts[0].anomalyScore : 0;
+  // Highest risk across per-network security warnings and backend detector findings.
+  const highestRisk = Math.max(
+    0,
+    ...alerts.map((alert) => alert.anomalyScore ?? 0),
+    ...activeSecurityAlerts.map((alert) => alert.riskScore ?? 0),
+  );
+  const securityWarnings = [...alerts].sort(
+    (left, right) => (right.anomalyScore ?? 0) - (left.anomalyScore ?? 0),
+  );
 
   return (
     <div className="dashboard">
@@ -57,7 +64,7 @@ function Dashboard() {
             <AlertTriangle size={24} />
           </div>
           <div>
-            <p>Suspicious APs</p>
+            <p>Security Warnings</p>
             <h2>{alerts.length}</h2>
           </div>
         </div>
@@ -67,8 +74,8 @@ function Dashboard() {
             <Activity size={24} />
           </div>
           <div>
-            <p>Anomaly Score</p>
-            <h2>{anomalyScore}</h2>
+            <p>Highest Risk</p>
+            <h2>{highestRisk}</h2>
           </div>
         </div>
       </div>
@@ -83,11 +90,12 @@ function Dashboard() {
           <div className="network-list">
             {networks.map((network) => (
               <div
-                className="network-row"
+                className={`network-row${network.seenInLatestScan === false ? " not-current" : ""}`}
                 key={network.bssid}
+                title={network.seenInLatestScan === false ? "Not heard in the latest scan (seen within the last minute)" : undefined}
               >
                 <div>
-                  <strong>{network.ssid}</strong>
+                  <strong>{network.ssid || "(hidden network)"}</strong>
                   <small>{network.bssid}</small>
                 </div>
 
@@ -120,21 +128,26 @@ function Dashboard() {
             </div>
           )}
 
-          {alerts.length > 0 && (
-            <div className="alert-box">
+          {securityWarnings.slice(0, 4).map((warning) => (
+            <div className="alert-box" key={`${warning.type}-${warning.bssid}`}>
               <AlertTriangle size={22} />
 
               <div>
-                <strong>{alerts[0].message ?? "Potential Duplicate Network"}</strong>
+                <strong>{warning.message ?? "Potential Duplicate Network"}</strong>
 
-                <p>SSID: {alerts[0].ssid}</p>
-                <p>BSSID: {alerts[0].bssid}</p>
+                <p>SSID: {warning.ssid || "(hidden network)"}</p>
+                <p>BSSID: {warning.bssid}</p>
 
                 <span>
-                  Anomaly Score: {alerts[0].anomalyScore}/100
+                  {warning.severity} · Risk {warning.anomalyScore}/100
                 </span>
               </div>
             </div>
+          ))}
+          {securityWarnings.length === 0 && !trustedAP && (
+            <p className="dashboard-no-security-alerts">
+              No security warnings for the networks in range.
+            </p>
           )}
 
           <section className="dashboard-security-alerts">

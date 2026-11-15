@@ -12,6 +12,7 @@ function Networks() {
 
     if (network.suspicious) return "Suspicious";
     if (network.securityStatus === "insecure") return "Insecure";
+    if (network.securityStatus === "portal") return "Open (sign-in portal)";
     if (network.securityStatus === "weak") return "Weak encryption";
     if (network.securityStatus === "unknown") return "Unknown";
 
@@ -56,7 +57,7 @@ function Networks() {
         <div className="summary-card warning-card">
           <AlertTriangle size={22} />
           <div>
-            <span>Open / Suspicious</span>
+            <span>Weak / Open / Suspicious</span>
             <strong>
               {
                 networks.filter(
@@ -93,9 +94,13 @@ function Networks() {
                 const status = getStatus(network);
 
                 return (
-                  <tr key={network.bssid}>
+                  <tr
+                    key={network.bssid}
+                    className={network.seenInLatestScan === false ? "not-current" : undefined}
+                    title={network.seenInLatestScan === false ? "Not heard in the latest scan (seen within the last minute)" : undefined}
+                  >
                     <td>
-                      <strong>{network.ssid}</strong>
+                      <strong>{network.ssid || "(hidden network)"}</strong>
                     </td>
 
                     <td className="bssid">

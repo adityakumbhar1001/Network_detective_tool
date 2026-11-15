@@ -1,15 +1,19 @@
 import { createServer } from "node:http";
+import { createSocket } from "node:dgram";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { processScanDetections } from "./detector.js";
+import { isKnownCampusSsid, processScanDetections, sameRouterBssids } from "./detector.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_NETWORKS = 200;
 const STALE_AFTER_MS = 30_000;
+const RECENT_NETWORK_WINDOW_MS = 60_000;
 const HISTORY_LIMIT = 100;
+const DISCOVERY_REQUEST = "WIFISHIELD_DISCOVER";
+const DISCOVERY_REPLY = "WIFISHIELD_API";
 const DEFAULT_STATE_PATH = resolve(process.cwd(), ".wifi-shield-state.json");
 
 function sendJson(response, statusCode, body) {
@@ -57,6 +61,7 @@ function normalizeSecurity(value) {
   if (!security || security === "UNKNOWN" || security === "WIFI AUTH MAX") {
     return "Unknown";
   }
+  if (security.includes("OWE") || security.includes("ENHANCED OPEN")) return "OWE";
   if (security.includes("OPEN")) return "Open";
   if (security.includes("WEP")) return "WEP";
   if (security.includes("WPA2") && security.includes("WPA3")) return "WPA2/WPA3";
@@ -67,13 +72,42 @@ function normalizeSecurity(value) {
   return "Unknown";
 }
 
-function getSecurityStatus(security) {
+// Cipher names as reported by the ESP32 (e.g. "CCMP", "TKIP/CCMP"); null when not reported.
+function normalizeCipher(value) {
+  if (value == null) return null;
+  const cipher = String(value).trim().toUpperCase().slice(0, 16);
+  return cipher || null;
+}
+
+// The cipher decides mixed modes: WPA/WPA2 with AES (CCMP) only is as strong as WPA2,
+// while any mode that still allows TKIP is weak. Without cipher data (older firmware),
+// WPA/WPA2 stays "weak" because TKIP cannot be ruled out.
+function getSecurityStatus(security, { cipherKnown = false, usesTkip = false } = {}) {
   if (security === "Open") return "insecure";
-  if (security === "WEP" || security === "WPA" || security === "WPA/WPA2") return "weak";
-  if (security === "WPA2" || security === "WPA3" || security === "WPA2/WPA3") {
-    return "encrypted";
-  }
+  if (security === "WEP" || security === "WPA") return "weak";
+  if (security === "WPA/WPA2") return cipherKnown && !usesTkip ? "encrypted" : "weak";
+  if (security === "WPA2") return usesTkip ? "weak" : "encrypted";
+  if (security === "WPA3" || security === "WPA2/WPA3" || security === "OWE") return "encrypted";
   return "unknown";
+}
+
+function weakSecurityFinding(network) {
+  if (network.security === "WEP") {
+    return { message: "WEP encryption is broken and can be cracked within minutes.", anomalyScore: 85 };
+  }
+  if (network.security === "WPA") {
+    return { message: "WPA (version 1) is deprecated; use WPA2 with AES or WPA3.", anomalyScore: 75 };
+  }
+  if (network.usesTkip) {
+    return {
+      message: `${network.security} still allows the deprecated TKIP cipher; use AES (CCMP) only.`,
+      anomalyScore: 65,
+    };
+  }
+  return {
+    message: "WPA/WPA2 mixed mode may still allow legacy WPA/TKIP (cipher not reported).",
+    anomalyScore: 55,
+  };
 }
 
 function loadPersistentState(persistencePath, trustedNetwork) {
@@ -174,13 +208,20 @@ function validateScan(body) {
     }
 
     const security = normalizeSecurity(network.security ?? network.authType);
+    const pairwiseCipher = normalizeCipher(network.pairwiseCipher);
+    const groupCipher = normalizeCipher(network.groupCipher);
+    const cipherKnown = pairwiseCipher !== null && pairwiseCipher !== "UNKNOWN";
+    const usesTkip = [pairwiseCipher, groupCipher].some((cipher) => cipher?.includes("TKIP"));
     return {
       ssid,
       bssid,
       rssi,
       channel,
       security,
-      securityStatus: getSecurityStatus(security),
+      pairwiseCipher,
+      groupCipher,
+      usesTkip,
+      securityStatus: getSecurityStatus(security, { cipherKnown, usesTkip }),
       trusted: false,
       lastSeen: scannedAt,
     };
@@ -189,21 +230,75 @@ function validateScan(body) {
   return { deviceId, scannedAt, networks };
 }
 
+// Detector findings present in the latest scan. state.alerts keeps every finding ever
+// raised (persisted across restarts); only conditions still observed in the most recent
+// scan are reported, so stale findings disappear after the next scan (e.g. ESP32 reset).
+function latestAlerts(state) {
+  const current = new Set(state.currentConditions ?? []);
+  return state.alerts.filter((alert) => current.has(alert.conditionKey));
+}
+
+// Networks heard in recent scans from the current device. Weak, distant APs are often
+// missed by a single 3-second scan; keeping them for RECENT_NETWORK_WINDOW_MS (with
+// seenInLatestScan=false) stops the list flickering. Detection still uses only the
+// latest scan.
+function updateRecentNetworks(state, scan, receivedAt) {
+  if (!state.recentNetworks || state.recentDeviceId !== scan.deviceId) {
+    state.recentNetworks = new Map();
+    state.recentDeviceId = scan.deviceId;
+  }
+  for (const network of scan.networks) {
+    state.recentNetworks.set(network.bssid, { ...network, lastSeenAt: receivedAt });
+  }
+  const now = Date.parse(receivedAt);
+  for (const [bssid, network] of state.recentNetworks) {
+    if (now - Date.parse(network.lastSeenAt) > RECENT_NETWORK_WINDOW_MS) {
+      state.recentNetworks.delete(bssid);
+    }
+  }
+}
+
 function makeSnapshot(state) {
   const trustedBssid = state.trustedNetwork?.bssid ?? state.trustedBssid;
-  const networks = (state.latestScan?.networks ?? []).map((network) => ({
-    ...network,
-    trusted: Boolean(trustedBssid && network.bssid === trustedBssid),
-  }));
+  const latestReceivedAt = state.latestScan?.receivedAt;
+  const source = state.recentNetworks
+    ? [...state.recentNetworks.values()]
+    : (state.latestScan?.networks ?? []).map((network) => ({ ...network, lastSeenAt: latestReceivedAt }));
+  const networks = source
+    .map((network) => ({
+      ...network,
+      seenInLatestScan: network.lastSeenAt === latestReceivedAt,
+      trusted: Boolean(trustedBssid && network.bssid === trustedBssid),
+    }))
+    .sort((left, right) => right.rssi - left.rssi);
   const trustedAP = networks.find((network) => network.trusted) ?? null;
+
+  // Access points flagged by the campus vendor-prefix check show as suspicious.
+  const vendorMismatch = new Set(
+    latestAlerts(state)
+      .filter((alert) => alert.type === "CAMPUS_VENDOR_MISMATCH" && alert.status !== "Resolved")
+      .map((alert) => alert.observedBssid),
+  );
+  for (const network of networks) {
+    if (vendorMismatch.has(network.bssid)) network.suspicious = true;
+  }
+
+  // An open network with a known campus name is almost certainly a sign-in portal
+  // (the scan cannot see the login page), so label it "portal" instead of plain "open".
+  for (const network of networks) {
+    if (network.securityStatus === "insecure" && isKnownCampusSsid(network.ssid)) {
+      network.securityStatus = "portal";
+    }
+  }
 
   if (state.trustedNetwork?.ssid || trustedAP) {
     const trustedSsid = state.trustedNetwork?.ssid || trustedAP?.ssid;
     for (const network of networks) {
-      network.suspicious = Boolean(
+      network.suspicious = network.suspicious || Boolean(
         network.ssid &&
         network.ssid === trustedSsid &&
-        network.bssid !== trustedBssid,
+        network.bssid !== trustedBssid &&
+        !(trustedBssid && sameRouterBssids(network.bssid, trustedBssid)),
       );
     }
   }
@@ -220,14 +315,24 @@ function makeSnapshot(state) {
         anomalyScore: 90,
         severity: "High",
       });
-    } else if (network.securityStatus === "weak") {
+    } else if (network.securityStatus === "portal") {
       alerts.push({
-        type: "WEAK_ENCRYPTION",
-        message: `${network.security} encryption is outdated.`,
+        type: "PORTAL_NETWORK",
+        message: "Open campus Wi-Fi with a browser sign-in: the radio link is unencrypted, so use HTTPS only.",
         ssid: network.ssid,
         bssid: network.bssid,
-        anomalyScore: 75,
-        severity: "High",
+        anomalyScore: 30,
+        severity: "Low",
+      });
+    } else if (network.securityStatus === "weak") {
+      const finding = weakSecurityFinding(network);
+      alerts.push({
+        type: "WEAK_ENCRYPTION",
+        message: finding.message,
+        ssid: network.ssid,
+        bssid: network.bssid,
+        anomalyScore: finding.anomalyScore,
+        severity: finding.anomalyScore >= 65 ? "High" : "Medium",
       });
     } else if (network.securityStatus === "unknown") {
       alerts.push({
@@ -267,7 +372,7 @@ function makeSnapshot(state) {
     receivedAt,
     networks,
     alerts,
-    securityAlerts: state.alerts,
+    securityAlerts: latestAlerts(state),
     trustedNetwork: state.trustedNetwork,
     trustedAP,
     channels: [...channelCounts.entries()]
@@ -276,6 +381,31 @@ function makeSnapshot(state) {
     heatmap: networks.length ? [networks.map((network) => network.rssi)] : [],
     history: state.history,
   };
+}
+
+// The small display lists one card per network name: access points sharing a name (and the
+// same security) collapse into the strongest one with apCount. Trusted, suspicious and
+// hidden entries stay separate so nothing important is hidden. Input is sorted by RSSI.
+function groupForDisplay(networks) {
+  const groups = new Map();
+  const result = [];
+  for (const network of networks) {
+    if (!network.ssid || network.trusted || network.suspicious) {
+      result.push({ ...network, apCount: 1 });
+      continue;
+    }
+    const key = `${network.ssid.toLowerCase()}|${network.securityStatus}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.apCount += 1;
+      existing.seenInLatestScan ||= network.seenInLatestScan;
+    } else {
+      const entry = { ...network, apCount: 1 };
+      groups.set(key, entry);
+      result.push(entry);
+    }
+  }
+  return result;
 }
 
 function makeDisplaySnapshot(state) {
@@ -299,7 +429,7 @@ function makeDisplaySnapshot(state) {
     deviceId: snapshot.deviceId,
     scannedAt: snapshot.scannedAt,
     receivedAt: snapshot.receivedAt,
-    networks: snapshot.networks.map((network) => ({
+    networks: groupForDisplay(snapshot.networks).map((network) => ({
       ssid: network.ssid,
       bssid: network.bssid,
       rssi: network.rssi,
@@ -308,6 +438,8 @@ function makeDisplaySnapshot(state) {
       securityStatus: network.securityStatus,
       trusted: network.trusted,
       suspicious: network.suspicious,
+      seenInLatestScan: network.seenInLatestScan,
+      apCount: network.apCount ?? 1,
     })),
     securityAlerts: snapshot.securityAlerts
       .filter((alert) => alert.status !== "Resolved")
@@ -334,7 +466,7 @@ function makeDisplayAlerts(state) {
     "status",
     "evidence",
   ];
-  const alerts = state.alerts
+  const alerts = latestAlerts(state)
     .filter((alert) => alert.status !== "Resolved")
     .map((alert) => Object.fromEntries(
       alertFields
@@ -433,9 +565,10 @@ export function createWifiServer({
           sendJson(response, 200, makeDisplayAlerts(state));
           return;
         }
-        const activeAlerts = state.alerts.filter((alert) => alert.status !== "Resolved");
+        const alerts = latestAlerts(state);
+        const activeAlerts = alerts.filter((alert) => alert.status !== "Resolved");
         sendJson(response, 200, {
-          alerts: state.alerts,
+          alerts,
           activeCount: activeAlerts.length,
           highPriorityCount: activeAlerts.filter((alert) => alert.severity === "High" || alert.severity === "Critical").length,
         });
@@ -456,6 +589,7 @@ export function createWifiServer({
         const scan = validateScan(await readJson(request));
         const receivedAt = new Date().toISOString();
         state.latestScan = { ...scan, receivedAt };
+        updateRecentNetworks(state, scan, receivedAt);
         console.info(
           `[${receivedAt}][CYCLE ${cycleId}][SCAN] latest scan updated ` +
           `deviceId=${scan.deviceId} scannedAt=${scan.scannedAt} receivedAt=${receivedAt} ` +
@@ -558,5 +692,22 @@ if (isMainModule) {
 
   server.listen(port, "0.0.0.0", () => {
     console.log(`WiFiShield API listening on http://0.0.0.0:${port}`);
+  });
+
+  // LAN discovery: the ESP32 broadcasts DISCOVERY_REQUEST on this UDP port and uses the
+  // sender address of the reply as its API host, so the firmware needs no PC IP.
+  const discoveryPort = Number(process.env.DISCOVERY_PORT ?? port);
+  const discovery = createSocket({ type: "udp4", reuseAddr: true });
+  discovery.on("message", (message, remote) => {
+    if (message.toString().trim() !== DISCOVERY_REQUEST) return;
+    discovery.send(`${DISCOVERY_REPLY} ${port}`, remote.port, remote.address);
+    console.log(`[DISCOVERY] answered ${remote.address}:${remote.port} with API port ${port}`);
+  });
+  discovery.on("error", (error) => {
+    console.error(`[DISCOVERY] UDP ${discoveryPort} unavailable: ${error.message}`);
+    discovery.close();
+  });
+  discovery.bind(discoveryPort, "0.0.0.0", () => {
+    console.log(`WiFiShield discovery listening on udp://0.0.0.0:${discoveryPort}`);
   });
 }
