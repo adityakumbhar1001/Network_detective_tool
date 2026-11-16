@@ -31,8 +31,9 @@ export function isKnownCampusSsid(ssid) {
 
 // Vendor prefix = first three bytes of the BSSID, ignoring the locally-administered bit
 // (virtual SSIDs of one AP differ only there). WIFISHIELD_CAMPUS_OUIS="AA:BB:CC,..." lists
-// the prefixes the campus really uses; without it the prefixes shared by at least two
-// access points of the same campus SSID are taken as normal.
+// adds more campus prefixes and makes the check strict. Built-in VIT prefixes, and the
+// prefixes shared by at least two access points of a campus SSID, are always normal; other
+// prefixes are reported only if their security setting also differs (or always, if strict).
 export function vendorPrefix(bssid) {
   const bytes = String(bssid ?? "").split(":").map((part) => Number.parseInt(part, 16));
   if (bytes.length < 3 || bytes.slice(0, 3).some(Number.isNaN)) return null;
@@ -41,11 +42,18 @@ export function vendorPrefix(bssid) {
     .join(":");
 }
 
-const CAMPUS_OUIS = new Set(
-  (process.env.WIFISHIELD_CAMPUS_OUIS ?? "").split(",")
-    .map((prefix) => vendorPrefix(`${prefix.trim()}:00:00:00`))
-    .filter(Boolean),
-);
+function parsePrefixes(list) {
+  return list.map((prefix) => vendorPrefix(`${prefix.trim()}:00:00:00`)).filter(Boolean);
+}
+
+// Prefixes measured from the VIT campus access points (three vendors, seen on every
+// VIT_* SSID). They are always treated as normal.
+const BUILT_IN_CAMPUS_OUIS = parsePrefixes(["E0:5D:54", "10:5F:02", "98:4A:6B"]);
+const EXTRA_CAMPUS_OUIS = parsePrefixes((process.env.WIFISHIELD_CAMPUS_OUIS ?? "").split(","));
+const CAMPUS_OUIS = new Set([...BUILT_IN_CAMPUS_OUIS, ...EXTRA_CAMPUS_OUIS]);
+// With the env list set the check is strict: any other prefix is reported. Without it an
+// unknown prefix is reported only when its security setting also differs.
+const STRICT_OUI_CHECK = EXTRA_CAMPUS_OUIS.length > 0;
 
 function campusVendorFindings(networks, addFinding, findings) {
   const groups = new Map();
@@ -55,17 +63,18 @@ function campusVendorFindings(networks, addFinding, findings) {
     groups.set(key, [...(groups.get(key) ?? []), network]);
   }
   for (const group of groups.values()) {
-    const counts = new Map();
-    for (const network of group) {
-      const prefix = vendorPrefix(network.bssid);
-      counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
-    }
-    let allowed = CAMPUS_OUIS;
-    if (!allowed.size) {
+    const allowed = new Set(CAMPUS_OUIS);
+    if (!STRICT_OUI_CHECK) {
       // Needs at least three access points to tell the usual hardware from an outlier.
       if (group.length < 3) continue;
-      allowed = new Set([...counts].filter(([, count]) => count >= 2).map(([prefix]) => prefix));
-      if (!allowed.size) continue;
+      const counts = new Map();
+      for (const network of group) {
+        const prefix = vendorPrefix(network.bssid);
+        counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+      }
+      for (const [prefix, count] of counts) {
+        if (count >= 2) allowed.add(prefix);
+      }
     }
     const securityCounts = new Map();
     for (const network of group) {
@@ -76,6 +85,9 @@ function campusVendorFindings(networks, addFinding, findings) {
       const prefix = vendorPrefix(network.bssid);
       if (!prefix || allowed.has(prefix)) continue;
       const securityDiffers = network.security !== usualSecurity;
+      // A real campus mixes many AP models, so without a known-prefix list a different
+      // vendor alone proves nothing; only report it when the security setting differs too.
+      if (!STRICT_OUI_CHECK && !securityDiffers) continue;
       const riskScore = boundedScore(60 + (securityDiffers ? 15 : 0));
       addFinding(findings, {
         type: "CAMPUS_VENDOR_MISMATCH",
