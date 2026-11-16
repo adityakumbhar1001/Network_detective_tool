@@ -389,7 +389,11 @@ test("flags a campus-named access point whose vendor prefix differs from the oth
           { ssid: "VIT_Student", bssid: "AA:11:22:00:00:01", rssi: -50, channel: 1, security: "Open" },
           { ssid: "VIT_Student", bssid: "AA:11:22:00:00:02", rssi: -55, channel: 6, security: "Open" },
           { ssid: "VIT_Student", bssid: "A8:11:22:00:00:03", rssi: -60, channel: 11, security: "Open" },
-          { ssid: "VIT_Student", bssid: "DE:AD:BE:EF:00:09", rssi: -45, channel: 6, security: "Open" },
+          { ssid: "VIT_Student", bssid: "DE:AD:BE:EF:00:09", rssi: -45, channel: 6, security: "WPA2" },
+          // Different vendor but same security as the campus APs: normal on a real campus.
+          { ssid: "VIT_Student", bssid: "00:AB:CD:00:00:07", rssi: -65, channel: 1, security: "Open" },
+          // Built-in VIT prefix: never an outlier, even if its security differs.
+          { ssid: "VIT_Student", bssid: "E2:5D:54:00:00:01", rssi: -70, channel: 6, security: "WPA2" },
         ],
       }),
     });
@@ -400,7 +404,7 @@ test("flags a campus-named access point whose vendor prefix differs from the oth
     const rogue = snapshot.networks.find((network) => network.bssid === "DE:AD:BE:EF:00:09");
     assert.equal(rogue.suspicious, true);
     const display = await (await fetch(`${url}/api/snapshot?display=1`)).json();
-    assert.equal(display.networks.length, 2);  // one grouped card (x3) + the flagged AP
+    assert.equal(display.networks.length, 3);  // grouped open card + the flagged AP + the built-in-prefix WPA2 AP
   } finally {
     await new Promise((resolve, reject) => vendorServer.close((error) => error ? reject(error) : resolve()));
   }
