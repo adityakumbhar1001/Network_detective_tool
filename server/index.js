@@ -305,6 +305,24 @@ function makeSnapshot(state) {
 
   const alerts = [];
 
+  // Informational notices that repeat for every access point of one network (campus portal,
+  // WPA3 transition mode) are combined into a single alert per SSID with an AP count. The
+  // strongest access point (networks are sorted by signal) is the one shown.
+  const addGroupedAlert = (alert) => {
+    const existing = alerts.find(
+      (other) =>
+        other.type === alert.type &&
+        other.apCount &&
+        String(other.ssid).trim().toLowerCase() === String(alert.ssid).trim().toLowerCase(),
+    );
+    if (existing) {
+      existing.apCount += 1;
+      existing.message = `${alert.message} (${existing.apCount} access points)`;
+    } else {
+      alerts.push({ ...alert, apCount: 1 });
+    }
+  };
+
   for (const network of networks) {
     if (network.securityStatus === "insecure") {
       alerts.push({
@@ -316,7 +334,7 @@ function makeSnapshot(state) {
         severity: "High",
       });
     } else if (network.security === "WPA2/WPA3") {
-      alerts.push({
+      addGroupedAlert({
         type: "WPA3_TRANSITION_MODE",
         message: "WPA2/WPA3 transition mode: a client can be pushed down to WPA2, so WPA3's extra protection is not guaranteed.",
         ssid: network.ssid,
@@ -325,7 +343,7 @@ function makeSnapshot(state) {
         severity: "Low",
       });
     } else if (network.securityStatus === "portal") {
-      alerts.push({
+      addGroupedAlert({
         type: "PORTAL_NETWORK",
         message: "Open campus Wi-Fi with a browser sign-in: the radio link is unencrypted, so use HTTPS only.",
         ssid: network.ssid,
