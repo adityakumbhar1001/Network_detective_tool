@@ -210,3 +210,19 @@ test("ranks Enhanced Open (OWE) above open networks and below WPA2", () => {
   assert.ok(securityStrength("OWE") > securityStrength("Open"));
   assert.ok(securityStrength("OWE") < securityStrength("WPA2"));
 });
+
+test("campus SSIDs on campus hardware (even unlisted or with a trailing space) are not duplicate warnings", () => {
+  const state = makeState();
+  const aps = (ssid, prefixes) =>
+    prefixes.map((prefix, index) =>
+      network(`${prefix}:00:00:0${index}`, { ssid, security: "WPA/WPA2" }));
+  processScanDetections(state, scan([
+    ...aps("VIT ", ["12:5F:02", "9A:4A:6B", "12:5F:02"]),
+    ...aps("VIT_VIP", ["12:5F:02", "9A:4A:6B"]),
+    ...aps("VIT_NEWSSID", ["10:5F:02", "98:4A:6B"]),
+    network("11:22:33:44:55:01", { ssid: "Cafe" }),
+    network("66:77:88:99:AA:02", { ssid: "Cafe" }),
+  ], 0));
+  const duplicates = state.alerts.filter((f) => f.type === "DUPLICATE_SSID_WARNING");
+  assert.deepEqual(duplicates.map((f) => f.ssid), ["Cafe"]);
+});
