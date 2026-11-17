@@ -19,7 +19,7 @@ const SECURITY_STRENGTH = {
 // browser sign-in page (captive portal), which a scan cannot see. Names are matched
 // case-insensitively. Add more with WIFISHIELD_CAMPUS_SSIDS="name1,name2".
 const CAMPUS_SSIDS = new Set(
-  ["VIT_Student", "VIT_Staff", "VIT_TPO",
+  ["VIT_Student", "VIT_Staff", "VIT_TPO", "VIT_VIP", "VIT",
     ...(process.env.WIFISHIELD_CAMPUS_SSIDS ?? "").split(",")]
     .map((name) => name.trim().toLowerCase())
     .filter(Boolean),
@@ -54,6 +54,12 @@ const CAMPUS_OUIS = new Set([...BUILT_IN_CAMPUS_OUIS, ...EXTRA_CAMPUS_OUIS]);
 // With the env list set the check is strict: any other prefix is reported. Without it an
 // unknown prefix is reported only when its security setting also differs.
 const STRICT_OUI_CHECK = EXTRA_CAMPUS_OUIS.length > 0;
+
+// True when every access point of an SSID uses campus hardware prefixes: one campus
+// network spread over many APs, so it is not a duplicate-SSID warning.
+function allOnCampusHardware(group) {
+  return group.length > 0 && group.every((network) => CAMPUS_OUIS.has(vendorPrefix(network.bssid)));
+}
 
 function campusVendorFindings(networks, addFinding, findings) {
   const groups = new Map();
@@ -237,7 +243,7 @@ function makeFindings(state, scan, thresholdDb) {
     const isTrustedSsid = Boolean(trusted?.ssid && ssid === trusted.ssid);
     if (group.length < 2 && !isTrustedSsid) continue;
     // Known campus SSIDs legitimately have many access points: no duplicate warning.
-    if (!isTrustedSsid && isKnownCampusSsid(ssid)) continue;
+    if (!isTrustedSsid && (isKnownCampusSsid(ssid) || allOnCampusHardware(group))) continue;
     // Untrusted SSIDs: radios of the same router are one network, not a duplicate.
     const candidates = isTrustedSsid
       ? group.filter((network) => network.bssid !== trusted.bssid)

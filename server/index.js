@@ -443,7 +443,7 @@ function groupForDisplay(networks) {
       result.push({ ...network, apCount: 1 });
       continue;
     }
-    const key = `${network.ssid.toLowerCase()}|${network.securityStatus}`;
+    const key = `${network.ssid.trim().toLowerCase()}|${network.securityStatus}`;
     const existing = groups.get(key);
     if (existing) {
       existing.apCount += 1;
