@@ -437,6 +437,35 @@ body {
   font-size: 12px;
 }
 
+.info-tip {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background: #eef5ff;
+  color: #2a62b5;
+}
+
+.info-tip svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.info-tip strong {
+  display: block;
+  color: #1f4f98;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.info-tip p {
+  margin: 6px 0 0;
+  color: #697386;
+  font-size: 12px;
+}
+
 .alert-box span {
   font-size: 12px;
   font-weight: 600;
