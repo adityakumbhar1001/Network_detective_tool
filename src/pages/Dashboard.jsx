@@ -3,6 +3,7 @@ import {
   ShieldCheck,
   AlertTriangle,
   Activity,
+  Info,
 } from "lucide-react";
 
 import { useWifiData } from "../useWifiData";
@@ -165,9 +166,14 @@ function Dashboard() {
             </div>
           ))}
           {tips.map((tip) => (
-            <p className="dashboard-no-security-alerts" key={tip.type}>
-              ℹ {tip.message} ({tip.ssids.join(", ")})
-            </p>
+            <div className="info-tip" key={tip.type}>
+              <Info size={20} />
+
+              <div>
+                <strong>{tip.message}</strong>
+                <p>Networks: {tip.ssids.join(", ")}</p>
+              </div>
+            </div>
           ))}
           {securityWarnings.length === 0 && !trustedAP && (
             <p className="dashboard-no-security-alerts">
