@@ -305,8 +305,8 @@ function makeSnapshot(state) {
 
   const alerts = [];
 
-  // Informational notices that repeat for every access point of one network (campus portal,
-  // WPA3 transition mode) are combined into a single alert per SSID with an AP count. The
+  // Informational notices that repeat for every access point of one network (campus portal)
+  // are combined into a single alert per SSID with an AP count. The
   // strongest access point (networks are sorted by signal) is the one shown.
   const addGroupedAlert = (alert) => {
     const existing = alerts.find(
@@ -332,15 +332,6 @@ function makeSnapshot(state) {
         bssid: network.bssid,
         anomalyScore: 90,
         severity: "High",
-      });
-    } else if (network.security === "WPA2/WPA3") {
-      addGroupedAlert({
-        type: "WPA3_TRANSITION_MODE",
-        message: "WPA2/WPA3 transition mode: a client can be pushed down to WPA2, so WPA3's extra protection is not guaranteed.",
-        ssid: network.ssid,
-        bssid: network.bssid,
-        anomalyScore: 15,
-        severity: "Low",
       });
     } else if (network.securityStatus === "portal") {
       addGroupedAlert({
@@ -384,6 +375,23 @@ function makeSnapshot(state) {
     }
   }
 
+  // Informational tips: shown on their own, not counted as security alerts.
+  const tips = [];
+  const transitionSsids = [...new Set(
+    networks
+      .filter((network) => network.security === "WPA2/WPA3" && network.seenInLatestScan !== false)
+      .map((network) => network.ssid || "(hidden network)"),
+  )];
+  if (transitionSsids.length) {
+    tips.push({
+      type: "WPA3_TRANSITION_MODE",
+      message: transitionSsids.length === 1
+        ? "1 network uses WPA2/WPA3 transition mode. It stays encrypted; a WPA3-capable device could in theory be pushed down to WPA2."
+        : `${transitionSsids.length} networks use WPA2/WPA3 transition mode. They stay encrypted; a WPA3-capable device could in theory be pushed down to WPA2.`,
+      ssids: transitionSsids,
+    });
+  }
+
   const channelCounts = new Map();
   for (const network of networks) {
     channelCounts.set(network.channel, (channelCounts.get(network.channel) ?? 0) + 1);
@@ -399,6 +407,7 @@ function makeSnapshot(state) {
     receivedAt,
     networks,
     alerts,
+    tips,
     securityAlerts: latestAlerts(state),
     health: computeHealth(networks, latestAlerts(state)),
     channelAdvice: computeChannelAdvice(networks),

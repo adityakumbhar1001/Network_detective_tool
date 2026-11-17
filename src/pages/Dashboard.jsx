@@ -8,7 +8,7 @@ import {
 import { useWifiData } from "../useWifiData";
 
 function Dashboard() {
-  const { networks, alerts, securityAlerts = [], trustedAP, modeLabel, health, channelAdvice } = useWifiData();
+  const { networks, alerts, securityAlerts = [], trustedAP, modeLabel, health, channelAdvice, tips = [] } = useWifiData();
   const activeSecurityAlerts = securityAlerts.filter((alert) => alert.status !== "Resolved");
 
   // Highest risk across per-network security warnings and backend detector findings.
@@ -163,6 +163,11 @@ function Dashboard() {
                 </span>
               </div>
             </div>
+          ))}
+          {tips.map((tip) => (
+            <p className="dashboard-no-security-alerts" key={tip.type}>
+              ℹ {tip.message} ({tip.ssids.join(", ")})
+            </p>
           ))}
           {securityWarnings.length === 0 && !trustedAP && (
             <p className="dashboard-no-security-alerts">
