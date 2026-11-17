@@ -434,7 +434,10 @@ test("reports a health score, a least-crowded channel and a WPA3 transition note
     assert.equal(clean.channelAdvice.recommended, 11);
     assert.equal(clean.health.score, 100);
     assert.equal(clean.health.label, "Good");
-    assert.ok(clean.alerts.some((alert) => alert.type === "WPA3_TRANSITION_MODE" && alert.severity === "Low"));
+    assert.ok(!clean.alerts.some((alert) => alert.type === "WPA3_TRANSITION_MODE"));
+    assert.equal(clean.tips.length, 1);
+    assert.equal(clean.tips[0].type, "WPA3_TRANSITION_MODE");
+    assert.deepEqual(clean.tips[0].ssids, ["Six"]);
 
     await postScan([
       { ssid: "Cafe", bssid: "40:00:00:00:00:04", rssi: -50, channel: 11, security: "Open" },
