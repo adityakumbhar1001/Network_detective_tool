@@ -362,7 +362,11 @@ test("labels open campus networks as sign-in portals and groups their access poi
     const byBssid = Object.fromEntries(full.networks.map((network) => [network.bssid, network.securityStatus]));
     assert.equal(byBssid["10:00:00:00:00:01"], "portal");
     assert.equal(byBssid["40:00:00:00:00:04"], "insecure");
-    assert.ok(full.alerts.some((alert) => alert.type === "PORTAL_NETWORK" && alert.severity === "Low"));
+    const portalAlerts = full.alerts.filter((alert) => alert.type === "PORTAL_NETWORK");
+    assert.equal(portalAlerts.length, 1);
+    assert.equal(portalAlerts[0].severity, "Low");
+    assert.equal(portalAlerts[0].apCount, 3);
+    assert.match(portalAlerts[0].message, /3 access points/);
     assert.ok(full.alerts.some((alert) => alert.type === "OPEN_NETWORK" && alert.ssid === "CafeOpen"));
     assert.equal(full.securityAlerts.filter((alert) => alert.type === "DUPLICATE_SSID_WARNING").length, 0);
 
