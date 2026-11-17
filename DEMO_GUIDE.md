@@ -46,6 +46,8 @@ Open **http://localhost:5173** in the browser. Leave this window open too.
 
 ## 4. Power the ESP32
 Plug the ESP32 into the laptop's USB (or press its **EN** button if already plugged in).
+A phone charger or power bank on the ESP32's USB port also works. The battery circuit is
+optional; with no cell the corner of the screen shows "USB".
 
 What you should see, in order:
 1. Display: white → brief coloured noise → white → "WiFiShield display test" → Networks screen.
@@ -72,7 +74,8 @@ This setting is kept by the backend, so it only needs doing once per network.
 - **HOME** → four tiles: Networks, Alerts, Security, Settings.
 - **Networks**: 3 networks per page; **PREV / NEXT** move between pages (grey = no more pages).
 - **Alerts**: one backend finding per page; PREV / NEXT move between findings.
-- **Security**: counts of encrypted / weak / open networks and active findings.
+- **Security**: counts of encrypted / weak / open / portal networks, the **health score**
+  (Good / Fair / Poor), the least crowded channel and active findings.
 - **Settings**: device ID, Wi-Fi status, the ESP32's IP, and the backend address it discovered.
 
 ---

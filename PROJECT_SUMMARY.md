@@ -33,7 +33,7 @@ Three parts:
 1. **ESP32 firmware** (`esp32/wifi_shield_esp32/`): Arduino C++. Scans, draws the touch UI,
    uploads scans, downloads the analysed snapshot.
 2. **Backend** (`server/`): Node.js using only built-in modules. REST API, detection
-   engine, persistence, LAN discovery. 21 automated tests.
+   engine, persistence, LAN discovery, health score. 25 automated tests.
 3. **Dashboard** (`src/`): React + Vite. Pages: Dashboard, Networks, Signal Heatmap,
    Security, Channels, Survey History.
 
@@ -82,11 +82,18 @@ each beacon; the cipher decides mixed modes.
 | WPA2, WPA2/WPA3, WPA3 (personal and enterprise) | AES | **encrypted** | – |
 | OWE (Enhanced Open) | – | encrypted (does not authenticate the AP) | – |
 | WAPI, DPP, anything unrecognised | – | unknown | Unknown security (45) |
+| Open, but the name is a known campus network (VIT_Student, VIT_Staff, VIT_TPO, VIT_VIP, VIT) | – | **portal** | Open campus Wi-Fi with a browser sign-in: use HTTPS only (30, Low) |
 
 Example from testing: the home router "Aditya Yadnik" advertises WPA/WPA2 with pairwise
 `TKIP/CCMP` and group `TKIP` → correctly **weak**; fix on the router by selecting
 **WPA2-PSK with AES** only (or WPA2/WPA3). Windows shows it as "WPA2/CCMP" because that is
 what the laptop itself negotiated, not everything the router accepts.
+
+**Grouping and tips:** notices that repeat for every access point of one network (the campus
+portal notice) are combined into one alert per network with an access-point count, e.g.
+"(7 access points)". WPA2/WPA3 transition mode is not an alert: it is shown as a blue
+informational tip under Security Status, because most phone hotspots and home routers use it
+and it does not count against the health score.
 
 **Dashboard note:** the "Anomaly Score" card and the "Security Status" box show the first
 per-network security warning and its fixed risk score; "Suspicious APs" counts those
@@ -103,7 +110,8 @@ indicator, not proof.
 | **Suspicious duplicate AP** (evil twin) | another BSSID advertises the *trusted* SSID | 45 base, +22 weaker security than expected, +5 different channel, +12 signal far from the trusted baseline, +12 signal anomaly. A BSSID from the trusted router's own address block scores 20 (likely its second radio). |
 | **Security downgrade** | the trusted SSID appears with weaker security than expected (e.g. WPA2 → Open) | 65, +27 if it became Open, +8 if also a duplicate, +8 with a signal anomaly |
 | **RSSI anomaly** | an AP's signal moves ≥ 20 dB from its rolling 12-scan baseline in **two consecutive scans** | 48, +12 duplicate, +18 downgrade |
-| **Duplicate SSID warning** | an untrusted SSID is advertised by several different routers | 30 (Low – often legitimate mesh/repeaters) |
+| **Duplicate SSID warning** | an untrusted SSID is advertised by several different routers | 30 (Low – often legitimate mesh/repeaters). Not raised for campus network names, nor for an SSID whose access points all use known campus hardware prefixes. |
+| **Campus vendor mismatch** | an access point on a campus SSID has a vendor prefix that is not a known campus prefix and not shared by at least two APs of the group | 60 (+15 if its security differs from the group's). By default needs ≥ 3 APs and a differing security setting; if `WIFISHIELD_CAMPUS_OUIS` is set, any other prefix is reported. |
 | Per-network warnings | open / weak / unknown security | shown on cards and dashboard |
 
 **Trusted access point:** set once in Dashboard → Security. It is the baseline for the
@@ -121,12 +129,16 @@ history is kept on disk but stale findings are not displayed.
 - Memory safety: fixed a per-cycle memory leak; a guard restarts the device cleanly if
   memory ever runs low instead of silently stopping.
 - Structured serial logs (`[time][CYCLE n][LEVEL][STAGE]`) for every step.
+- **Health score and channel advice** shown on the Security screen (see section 9a).
+- Networks that share a name and security are merged into one card with an AP count.
+- Optional battery reading on GPIO 33 (divider); with no cell it shows "USB". The battery
+  circuit is optional and not needed for the demo; wiring diagrams are in `esp32/diagrams/`.
 
 ## 8. Backend API
 | Endpoint | Purpose |
 |---|---|
 | `POST /api/scans` | receive a scan (validated: MAC format, RSSI −127..0, channel, ≤ 200 networks, no duplicate BSSIDs; optional device token) |
-| `GET /api/snapshot` | latest networks, classifications, alerts, channels, history |
+| `GET /api/snapshot` | latest networks, classifications, alerts, tips, health score, channel advice, history |
 | `GET /api/health` | `live` (scan < 30 s old), `stale`, or `waiting` |
 | `GET /api/alerts`, `PUT /api/alerts/:id` | list findings; mark Acknowledged / Resolved |
 | `GET/PUT /api/trusted-network` | read / set the trusted access point |
@@ -143,6 +155,15 @@ history is kept on disk but stale findings are not displayed.
 - **Network list memory**: networks heard within the last 60 s stay listed (dimmed on the
   dashboard) so weak, distant APs do not flicker in and out between scans. Detection still
   uses only the latest scan.
+
+## 9a. Network health score and best channel
+- **Health score (0-100):** starts at 100 and loses points for open networks (6 each, max 36),
+  weak encryption (3 each, max 18), campus portals (1 each, max 5) and active detector
+  findings (Critical 20, High 12, Medium 5, Low 1; max 45). Labels: **Good ≥ 80, Fair ≥ 60,
+  Poor < 60**. It describes the surroundings, not internet speed.
+- **Least crowded channel:** the least loaded of the non-overlapping 2.4 GHz channels
+  1, 6 and 11, counting stronger neighbouring signals more.
+- Both are shown on the device (Security screen) and on the dashboard.
 
 ## 10. Scan range – measured
 Four scan settings were compared on the device (active 100–300 ms and 150–600 ms per

@@ -21,7 +21,10 @@
 | Network list | Only the last scan; weak APs flickered in and out; unsorted | Networks heard in the last 60 s, strongest first, marked when missed by the latest scan |
 | Device Networks screen | Name and signal only; page jumped back to 1 every 15 s | Verdict badge, signal, channel, security; current page kept |
 | Dashboard wording | "Suspicious APs" counted security warnings; "Anomaly Score" was only the first warning's score; status box showed one warning; sidebar always said "Demo Mode" | "Security Warnings", "Highest Risk" (max over all findings), all warnings listed, sidebar shows the real connection state; hidden networks named |
-| Backend tests / lint | 14 tests; 2 lint errors | 21 tests passing; lint clean |
+| Campus Wi-Fi (VIT) | Every campus access point looked suspicious; "campus vendor mismatch" alerts and a duplicate warning per AP | Known campus names and hardware prefixes are treated as normal; open campus networks shown as PORTAL; one combined notice per network |
+| Info vs alerts | WPA2/WPA3 transition mode raised an alert on almost every scan | Shown as a single informational tip, not counted as an alert |
+| Summary of surroundings | None | Health score (Good/Fair/Poor) and least-crowded channel on device and dashboard |
+| Backend tests / lint | 14 tests; 2 lint errors | 25 tests passing; lint clean |
 
 ## 2. How the display problem was solved (evidence-based)
 The original firmware drove the display over SPI and shared GPIO 5 between the display and
@@ -60,7 +63,8 @@ Each step changed one thing and measured the result:
   samples disagree, measured calibration with Y inverted. Edge touches are clamped instead of
   rejected.
 - **Pin conflict fixed**: the alert LED was on GPIO 32 (now the display's RD line) and was
-  never configured as an output → moved to GPIO 33 and initialised.
+  never configured as an output. GPIO 33 is now used for the optional battery divider, so the
+  LED is disabled by default (`ALERT_LED_PIN = -1`); alerts are shown on the screen.
 - **Memory leak fixed**: the backend task ended with `vTaskDelete()`, which never returns,
   so the ~25 KB response and two HTTP clients were never freed (**~30 KB lost per cycle**,
   upload stopped after ~5 cycles). The work now runs in its own function so everything is
@@ -92,7 +96,19 @@ Each step changed one thing and measured the result:
   warning states its specific reason and risk score instead of a generic "outdated".
 - **Tests**: 6 new tests (latest-only alerts, same-router recognition, no false duplicate
   warning, lower-risk same-router duplicate on the trusted SSID, OWE ranking, cipher-based
-  classification). 20/20 pass.
+  classification). 20/20 passed at that point; the suite now has 25 tests (see below).
+
+### Later backend changes
+- **Campus handling**: campus names (VIT_Student, VIT_Staff, VIT_TPO, VIT_VIP, VIT, plus
+  `WIFISHIELD_CAMPUS_SSIDS`) and the three built-in VIT hardware prefixes are always normal.
+  Unknown prefixes are reported only if the security setting also differs, unless
+  `WIFISHIELD_CAMPUS_OUIS` is set (strict mode). An SSID whose APs all use campus hardware
+  prefixes never raises a duplicate-SSID warning.
+- **Combined notices**: repeated campus-portal notices become one alert per network with an
+  access-point count; the display merges APs with the same name and security into one card.
+- **Info tips**: WPA2/WPA3 transition mode moved from alerts to `tips` in the snapshot,
+  shown as an info box on the dashboard.
+- **Health score and best channel** (`computeHealth`, `computeChannelAdvice`).
 
 ## 5. How accuracy increased
 
