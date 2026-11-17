@@ -33,7 +33,10 @@ Interface mode per the manual's table: IM2=0, IM1=0, IM0=1 -> "MCU 8-bit paralle
 Calibration used by the firmware: raw X 300..3800, raw Y 200..3800 with Y inverted,
 rotation 1 (landscape), pressure threshold 100 (idle noise measured up to ~68).
 
-Alert LED (optional): GPIO 33.
+Alert LED (optional): disabled by default (`ALERT_LED_PIN = -1`) because GPIO 33 is used for the
+optional battery voltage divider; set it to a free output pin to use an LED.
+Battery (optional): cell voltage through a 100 k / 100 k divider to GPIO 33 (ratio 2.0); below
+2.5 V the firmware treats it as no cell and shows "USB". See `diagrams/`.
 
 ## Arduino setup
 - Board: **ESP32 Dev Module**, ESP32 Arduino core 3.3.x
